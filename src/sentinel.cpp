@@ -1188,50 +1188,49 @@ private:
         return "unknown";
     }
     
-    std::string grab_banner(int sock, int port) {
-        // Switch to blocking mode
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
-        
-        char buffer[4096] = {0};
-        
-        // Send probe based on port
-        std::string probe;
-        if (port == 80 || port == 8080 || port == 8000) {
-            probe = "HEAD / HTTP/1.0\r\n\r\n";
-        } else if (port == 21) {
-            // FTP - just wait for banner
-        } else if (port == 25) {
-            probe = "EHLO localhost\r\n";
-        } else if (port == 110) {
-            probe = "USER test\r\n";
-        } else if (port == 443) {
-            // HTTPS - would need SSL/TLS
-            return "";
-        } else if (port == 22) {
-            // SSH banner
-        } else {
-            probe = "\r\n";
-        }
-        
-        if (!probe.empty()) {
-            send(sock, probe.c_str(), probe.length(), 0);
-        }
-        
-        // Set receive timeout
-        struct timeval tv;
-        tv.tv_sec = 2;
-        tv.tv_usec = 0;
-        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        
-        int bytes = recv(sock, buffer, sizeof(buffer) - 1, 0);
-        if (bytes > 0) {
-            buffer[bytes] = '\0';
-            return clean_banner(buffer);
-        }
-        
-        return "";
+   std::string grab_banner(int sock, int port) {
+    // [DJ] Banner süresini TCP timeout ile aynı yapalım
+    int flags = fcntl(sock, F_GETFL, 0);
+    fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
+    
+    char buffer[4096] = {0};
+    
+    // Port'a özel probe
+    std::string probe;
+    if (port == 80 || port == 8080 || port == 8000) {
+        probe = "HEAD / HTTP/1.0\r\n\r\n";
+    } else if (port == 21) {
+        // FTP - just wait
+    } else if (port == 25) {
+        probe = "EHLO localhost\r\n";
+    } else if (port == 110) {
+        probe = "USER test\r\n";
+    } else if (port == 443) {
+        return "";  // HTTPS ayrı
+    } else if (port == 22) {
+        // SSH banner
+    } else {
+        probe = "\r\n";
     }
+    
+    if (!probe.empty()) {
+        send(sock, probe.c_str(), probe.length(), 0);
+    }
+    
+    // Change the wait second
+    struct timeval tv;
+    tv.tv_sec = 0;
+    tv.tv_usec = opts_.timeout_ms * 1000;  // Ana timeout'u kullan!
+    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+    
+    int bytes = recv(sock, buffer, sizeof(buffer) - 1, 0);
+    if (bytes > 0) {
+        buffer[bytes] = '\0';
+        return clean_banner(buffer);
+    }
+    
+    return "";
+}
     
     std::string clean_banner(const std::string& banner) {
         std::string result;
@@ -1258,6 +1257,10 @@ private:
         
         return "";
     }
+
+// [DJ] Bu hissəni tələsik yazmışam, sonra düzəldəcəm
+// TODO: Real CVE database əlavə et
+// FIXME: Sadəcə nümunə üçündür
     
     void check_vulnerabilities(ScanResult& result) {
         // Simple version-based vulnerability checks
