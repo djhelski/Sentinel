@@ -1289,7 +1289,7 @@ private:
         std::cout << "\n";
         std::cout << "  ╔════════════════════════════════════════════════╗\n";
         std::cout << "  ║              S E N T I N E L                   ║\n";
-        std::cout << "  ║        Advanced Port Scanner v2.0              ║\n";
+        std::cout << "  ║        Advanced Port Scanner v1.0              ║\n";
         std::cout << "  ║     Production-Ready Network Security Tool     ║\n";
         std::cout << "  ╚════════════════════════════════════════════════╝\n";
         std::cout << "\n";
