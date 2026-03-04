@@ -2,7 +2,7 @@
 
 ![License: MIT](https://img.shields.io/badge/License-MIT-yellow.svg)
 ![C++](https://img.shields.io/badge/C++-17-blue)
-![Version](https://img.shields.io/badge/version-2.0-green)
+![Version](https://img.shields.io/badge/version-1.0-green)
 
 **Sentinel** - High-performance network port scanner written in C++17.
 Professional tool for security testing and network exploration.
