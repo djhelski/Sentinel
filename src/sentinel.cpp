@@ -1,50 +1,379 @@
-#include <iostream>
-#include <vector>
-#include <string>
-#include <thread>
-#include <mutex>
-#include <queue>
-#include <chrono>
-#include <stdexcept>
-#include <csignal>
-#include <atomic>
+/*
+ * MIT License
+ *
+ * Copyright (c) 2025 Sentinel Contributors
+ *
+ * Permission is hereby granted, free of charge, to any person obtaining a copy
+ * of this software and associated documentation files (the "Software"), to deal
+ * in the Software without restriction, including without limitation the rights
+ * to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+ * copies of the Software, and to permit persons to whom the Software is
+ * furnished to do so, subject to the following conditions:
+ *
+ * The above copyright notice and this permission notice shall be included in all
+ * copies or substantial portions of the Software.
+ *
+ * THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+ * IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+ * FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+ * AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+ * LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+ * OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+ * SOFTWARE.
+ *
+ * ─────────────────────────────────────────────────────────────────────────────
+ * Sentinel — Advanced Port Scanner v3.0
+ *
+ * Build:
+ *   g++ -std=c++17 -O2 -pthread -o sentinel sentinel.cpp
+ *
+ * Root required for SYN and UDP scans (raw sockets).
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * COMPLETE FIX HISTORY  (v1.0 → v3.0)
+ * ─────────────────────────────────────────────────────────────────────────────
+ *
+ * ── v2.0 fixes (carried forward) ─────────────────────────────────────────────
+ * FIX-01  Double-mutex deadlock in print_result / submit_batch.
+ * FIX-02  SYN scan: recvfrom reply validated against target IP + port.
+ * FIX-03  rand() → per-thread std::mt19937 (thread-safe, better entropy).
+ * FIX-04  inet_ntoa → thread-safe inet_ntop throughout.
+ * FIX-05  CIDR mask: unsigned shift literal (1u) avoids signed UB.
+ * FIX-06  print_progress static local → std::atomic<int> member.
+ * FIX-07  Signal handler only touches atomic flag (async-signal-safe).
+ * FIX-08  ICMP/IP packet buffers declared alignas(4).
+ * FIX-09  TTL OS detection normalises to nearest initial value (64/128/255).
+ * FIX-10  get_ttl uses IP_TTL getsockopt instead of hard-coded 64.
+ * FIX-11  Rate limiting per-packet (inside loop) not per-batch.
+ * FIX-12  Vuln matching: structured VulnRecord with banner-prefix compare.
+ *
+ * ── v2.1 fixes (carried forward) ─────────────────────────────────────────────
+ * FIX-13  Lock-order inversion: merged into single io_mutex_.
+ * FIX-14  std::localtime → POSIX localtime_r (thread-safe).
+ * FIX-15  start_time/end_time wrapped in SafeTimePoint (shared_mutex).
+ * FIX-16  ping sweep: heap-allocated shared state, explicit lambda captures.
+ * FIX-17  ThreadPool::stop_ → std::atomic<bool>.
+ * FIX-18  grab_banner: partial-send retry loop + MSG_NOSIGNAL.
+ * FIX-19  udp_scan ICMP reply: source IP validated against target.
+ * FIX-20  expand_cidr: correct /32 and /31 handling.
+ *
+ * ── v3.0 new fixes ────────────────────────────────────────────────────────────
+ * FIX-21  icmp_ping: reply source IP now validated; per-thread unique ICMP
+ *         echo ID generated from ThreadRng to avoid cross-thread reply theft.
+ *         (CLASS A1, CLASS E1)
+ *
+ * FIX-22  TokenBucket::consume_one: missing decrement after sleep+relock
+ *         repaired via a spin-wait loop -- never skips a token.
+ *         (CLASS A3)
+ *
+ * FIX-23  tcp_connect: fcntl(F_GETFL) error handled; socket closed on
+ *         failure; POLLHUP/POLLERR revents checked before POLLOUT path.
+ *         (CLASS B1)
+ *
+ * FIX-24  send_syn / send_rst: inet_pton return value checked; function
+ *         returns false on failure so caller can fall back to connect scan.
+ *         (CLASS B2)
+ *
+ * FIX-25  udp_scan: POLLERR/POLLHUP on either fd sets status "error" and
+ *         breaks early rather than leaving "open|filtered".
+ *         (CLASS B3)
+ *
+ * FIX-26  Bounds-checked ihl offset helper (ihl_offset) used before every
+ *         TCP/ICMP header cast; malformed/truncated packets are discarded.
+ *         Applies to syn_scan, udp_scan, icmp_ping.
+ *         (CLASS C1, C2, C3)
+ *
+ * FIX-27  expand_cidr: /0 and large subnets capped at MAX_CIDR_HOSTS=65536
+ *         to prevent 4-billion-entry allocation.
+ *         (CLASS C5)
+ *
+ * FIX-28  setup_signal_handler called BEFORE perform_ping_sweep so Ctrl+C
+ *         is always handled gracefully.
+ *         (CLASS D1)
+ *
+ * FIX-29  Signal handler uses memory_order_release for g_stop_signal to
+ *         guarantee prompt visibility across all threads.
+ *         (CLASS D2)
+ *
+ * FIX-30  syn_scan ephemeral source port tracked via per-scanner atomic
+ *         counter (round-robin across 16 384 ephemeral ports) to eliminate
+ *         port collisions under high thread counts.
+ *         (CLASS E2)
+ *
+ * FIX-31  get_ttl for TCP connect scan: IP_TTL getsockopt returns local
+ *         send-TTL, not remote. FIX-10 was logically wrong. Corrected: TTL
+ *         is read from the raw IP header only for SYN/ICMP paths where a
+ *         raw socket is available. tcp_connect sets ttl=0 and os_hint=""
+ *         to avoid misleading "Linux/Unix/macOS" for every host.
+ *         (CLASS E4)
+ *
+ * FIX-32  ThreadRng seed hardened: xor of random_device output with
+ *         thread-local counter and steady_clock nanos to guarantee distinct
+ *         seeds even when random_device is deterministic.
+ *         (CLASS F3)
+ *
+ * FIX-33  ThreadPool enqueue: std::bind replaced with capturing lambda.
+ *         (CLASS F4)
+ *
+ * FIX-34  ArgParser: exit() replaced with exception throws; all stoi() calls
+ *         wrapped with try/catch providing user-friendly error messages.
+ *         (CLASS F5, C6)
+ *
+ * FIX-35  Input validation: timeout_ms clamped to [1, 30000]; num_threads
+ *         clamped to [1, 1024]; rate_limit validated > 0; thread count 0
+ *         corrected to hardware_concurrency before ThreadPool construction.
+ *         (CLASS G1, G2)
+ *
+ * FIX-36  Backpressure: submit_batch waits when pending queue exceeds
+ *         num_threads * 4 to cap unbounded memory growth.
+ *         (CLASS G3)
+ * ─────────────────────────────────────────────────────────────────────────────
+ */
+
 #include <algorithm>
-#include <fstream>
-#include <sstream>
-#include <map>
-#include <iomanip>
-#include <regex>
+#include <atomic>
+#include <chrono>
 #include <condition_variable>
+#include <fstream>
 #include <functional>
 #include <future>
-#include <random>
+#include <iomanip>
+#include <iostream>
+#include <map>
 #include <memory>
+#include <mutex>
+#include <queue>
+#include <random>
+#include <shared_mutex>
+#include <sstream>
+#include <stdexcept>
+#include <string>
+#include <thread>
+#include <vector>
 #include <cctype>
+#include <csignal>
+#include <cstring>
 
-// POSIX/Linux headers
-#include <sys/socket.h>
+// POSIX / Linux
+#include <arpa/inet.h>
+#include <errno.h>
+#include <fcntl.h>
+#include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/ip.h>
 #include <netinet/ip_icmp.h>
 #include <netinet/tcp.h>
-#include <arpa/inet.h>
-#include <unistd.h>
-#include <fcntl.h>
 #include <poll.h>
-#include <errno.h>
-#include <cstring>
-#include <netdb.h>
-#include <ifaddrs.h>
-#include <sys/time.h>
 #include <sys/resource.h>
+#include <sys/socket.h>
+#include <sys/time.h>
+#include <unistd.h>
 
 // ============================================================================
-// Global variables and forward declarations
+// Compile-time constants
 // ============================================================================
 
-class Sentinel;
+static constexpr size_t   MAX_CIDR_HOSTS   = 65536;   // FIX-27
+static constexpr int      MIN_TIMEOUT_MS   = 1;        // FIX-35
+static constexpr int      MAX_TIMEOUT_MS   = 30000;    // FIX-35
+static constexpr int      MAX_THREADS      = 1024;     // FIX-35
+static constexpr uint16_t EPH_PORT_BASE    = 49152;    // FIX-30
+static constexpr uint16_t EPH_PORT_COUNT   = 16384;    // FIX-30
+
+// ============================================================================
+// Global signal state
+// ============================================================================
+
 static std::atomic<bool> g_stop_signal{false};
-static Sentinel* g_sentinel_ptr{nullptr};
+
+// ============================================================================
+// FIX-32 — Hardened per-thread PRNG
+// ============================================================================
+
+namespace ThreadRng {
+
+    // FIX-32: xor random_device with thread-local counter + clock nanos
+    // so even a deterministic random_device gives distinct seeds per thread.
+    static thread_local std::mt19937 engine = [] {
+        static std::atomic<uint64_t> thread_counter{0};
+        uint64_t ctr   = thread_counter.fetch_add(1, std::memory_order_relaxed);
+        uint64_t nanos = static_cast<uint64_t>(
+            std::chrono::steady_clock::now().time_since_epoch().count());
+        std::random_device rd;
+        uint64_t rdev  = (static_cast<uint64_t>(rd()) << 32) | rd();
+        std::seed_seq seq{
+            static_cast<uint32_t>(rdev),
+            static_cast<uint32_t>(rdev >> 32),
+            static_cast<uint32_t>(nanos),
+            static_cast<uint32_t>(nanos >> 32),
+            static_cast<uint32_t>(ctr)
+        };
+        return std::mt19937(seq);
+    }();
+
+    inline uint32_t u32() {
+        return std::uniform_int_distribution<uint32_t>{}(engine);
+    }
+    inline uint16_t u16() {
+        return static_cast<uint16_t>(u32() & 0xFFFF);
+    }
+    inline uint16_t range16(uint16_t lo, uint16_t hi) {
+        return static_cast<uint16_t>(
+            std::uniform_int_distribution<uint32_t>{lo, hi}(engine));
+    }
+}
+
+// ============================================================================
+// FIX-22 — Per-packet Token Bucket (correct spin-wait)
+// ============================================================================
+
+class TokenBucket {
+public:
+    explicit TokenBucket(size_t rate_per_second)
+        : rate_(rate_per_second > 0 ? rate_per_second : 1)
+        , tokens_(rate_per_second > 0 ? rate_per_second : 1)
+        , last_refill_(std::chrono::steady_clock::now()) {}
+
+    // FIX-22: loop until a token is actually acquired
+    void consume_one() {
+        while (true) {
+            std::unique_lock<std::mutex> lk(mu_);
+            refill();
+            if (tokens_ >= 1) {
+                --tokens_;
+                return;
+            }
+            // Compute exact sleep for one token, then retry
+            double need_us = 1'000'000.0 / static_cast<double>(rate_);
+            lk.unlock();
+            std::this_thread::sleep_for(
+                std::chrono::microseconds(static_cast<long>(need_us)));
+        }
+    }
+
+private:
+    size_t     rate_;
+    size_t     tokens_;
+    std::chrono::steady_clock::time_point last_refill_;
+    std::mutex mu_;
+
+    void refill() {
+        auto now     = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(
+                           now - last_refill_);
+        size_t n = static_cast<size_t>(
+            static_cast<double>(elapsed.count()) * rate_ / 1'000'000.0);
+        if (n > 0) {
+            tokens_      = std::min(tokens_ + n, rate_);
+            last_refill_ = now;
+        }
+    }
+};
+
+// ============================================================================
+// FIX-17 + FIX-33 — Thread Pool
+// ============================================================================
+
+class ThreadPool {
+public:
+    // FIX-36: expose pending count for backpressure
+    size_t pending() const {
+        std::lock_guard<std::mutex> lk(mu_);
+        return tasks_.size();
+    }
+
+    explicit ThreadPool(size_t n) : stop_(false) {
+        if (n == 0) n = 1;
+        for (size_t i = 0; i < n; ++i) {
+            workers_.emplace_back([this] {
+                for (;;) {
+                    std::function<void()> task;
+                    {
+                        std::unique_lock<std::mutex> lk(mu_);
+                        cv_consumer_.wait(lk, [this] {
+                            return stop_.load(std::memory_order_acquire)
+                                   || !tasks_.empty();
+                        });
+                        if (stop_.load(std::memory_order_acquire)
+                                && tasks_.empty()) return;
+                        task = std::move(tasks_.front());
+                        tasks_.pop();
+                    }
+                    cv_producer_.notify_one(); // FIX-36: wake backpressure waiter
+                    try { task(); }
+                    catch (const std::exception& e) {
+                        std::cerr << "[pool] " << e.what() << '\n';
+                    }
+                }
+            });
+        }
+    }
+
+    // FIX-33: lambda instead of std::bind; FIX-36: backpressure cap
+    template<class F>
+    std::future<void> enqueue(F&& f, size_t max_pending = SIZE_MAX) {
+        auto task = std::make_shared<std::packaged_task<void()>>(
+            std::forward<F>(f));
+        auto fut = task->get_future();
+        {
+            std::unique_lock<std::mutex> lk(mu_);
+            if (stop_.load(std::memory_order_relaxed))
+                throw std::runtime_error("enqueue on stopped ThreadPool");
+            // FIX-36: block if queue is too deep
+            cv_producer_.wait(lk, [&] {
+                return tasks_.size() < max_pending
+                    || stop_.load(std::memory_order_relaxed);
+            });
+            tasks_.emplace([task]{ (*task)(); });
+        }
+        cv_consumer_.notify_one();
+        return fut;
+    }
+
+    ~ThreadPool() {
+        stop_.store(true, std::memory_order_release);
+        cv_consumer_.notify_all();
+        cv_producer_.notify_all();
+        for (auto& w : workers_)
+            if (w.joinable()) w.join();
+    }
+
+private:
+    std::vector<std::thread>          workers_;
+    std::queue<std::function<void()>> tasks_;
+    mutable std::mutex                mu_;
+    std::condition_variable           cv_consumer_;
+    std::condition_variable           cv_producer_; // FIX-36
+    std::atomic<bool>                 stop_;
+};
+
+// ============================================================================
+// FIX-15 — Thread-safe time_point wrapper
+// ============================================================================
+
+class SafeTimePoint {
+public:
+    using TP = std::chrono::steady_clock::time_point;
+
+    void set(TP tp) {
+        std::unique_lock<std::shared_mutex> lk(mu_);
+        val_   = tp;
+        ready_ = true;
+    }
+    TP get() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return val_;
+    }
+    bool is_ready() const {
+        std::shared_lock<std::shared_mutex> lk(mu_);
+        return ready_;
+    }
+
+private:
+    mutable std::shared_mutex mu_;
+    TP   val_{};
+    bool ready_{false};
+};
 
 // ============================================================================
 // Data structures
@@ -52,47 +381,43 @@ static Sentinel* g_sentinel_ptr{nullptr};
 
 struct ScanResult {
     std::string target;
-    int port{0};
+    int         port{0};
     std::string protocol{"tcp"};
     std::string status{"closed"};
     std::string service;
     std::string banner;
     std::string hostname;
-    int response_time_ms{0};
-    int ttl{0};
-    std::string os_hint;
+    int         response_time_ms{0};
+    int         ttl{0};         // 0 = unavailable (TCP connect path)
+    std::string os_hint;        // "" = unavailable
     std::chrono::system_clock::time_point timestamp;
 };
 
 struct ScanOptions {
     std::vector<std::string> targets;
-    std::vector<int> ports;
-    int start_port{1};
-    int end_port{1024};
-    int num_threads{0};
-    int timeout_ms{200};
-    int max_retries{2};
+    std::vector<int>         ports;
+    int         start_port{1};
+    int         end_port{1024};
+    int         num_threads{0};       // 0 → hardware_concurrency*2
+    int         timeout_ms{200};
     std::string output_file;
     std::string output_format{"text"};
-    bool verbose{false};
-    bool udp_scan{false};
-    bool syn_scan{false};
-    bool service_detection{true};
-    bool banner_grab{false};
-    bool reverse_dns{false};
-    bool icmp_ping{true};
-    bool randomize_ports{false};
-    int rate_limit{0};
+    bool        verbose{false};
+    bool        udp_scan{false};
+    bool        syn_scan{false};
+    bool        service_detection{true};
+    bool        banner_grab{false};
+    bool        reverse_dns{false};
+    bool        icmp_ping{true};
+    bool        randomize_ports{false};
+    int         rate_limit{0};
     std::vector<int> exclude_ports;
-    bool os_detection{false};
-    bool cidr_support{false};
-    bool json_output{false};
-    bool csv_output{false};
-    bool continuous_mode{false};
-    int scan_interval_sec{60};
-    bool vulnerability_check{false};
-    bool mac_lookup{false};
-    bool geoip{false};
+    bool        cidr_support{false};
+    bool        json_output{false};
+    bool        csv_output{false};
+    bool        continuous_mode{false};
+    int         scan_interval_sec{60};
+    bool        vulnerability_check{false};
 };
 
 struct ScanStatistics {
@@ -103,1684 +428,1370 @@ struct ScanStatistics {
     std::atomic<uint64_t> filtered_ports{0};
     std::atomic<uint64_t> timeouts{0};
     std::atomic<uint64_t> errors{0};
-    std::chrono::steady_clock::time_point start_time;
-    std::chrono::steady_clock::time_point end_time;
-    
+    SafeTimePoint start_time;
+    SafeTimePoint end_time;
+
     void reset() {
-        total_ports = 0;
-        scanned_ports = 0;
-        open_ports = 0;
-        closed_ports = 0;
-        filtered_ports = 0;
-        timeouts = 0;
-        errors = 0;
-        start_time = std::chrono::steady_clock::now();
+        total_ports = scanned_ports = open_ports = closed_ports = 0;
+        filtered_ports = timeouts = errors = 0;
+        start_time.set(std::chrono::steady_clock::now());
     }
-    
+
     double progress() const {
-        if (total_ports == 0) return 0.0;
-        return (100.0 * scanned_ports) / total_ports;
+        uint64_t total = total_ports.load(std::memory_order_relaxed);
+        uint64_t done  = scanned_ports.load(std::memory_order_relaxed);
+        return total == 0 ? 0.0 : (100.0 * done) / total;
     }
-    
+
     double packets_per_second() const {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(now - start_time);
+        auto now     = std::chrono::steady_clock::now();
+        auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
+                           now - start_time.get());
         if (elapsed.count() == 0) return 0.0;
-        return static_cast<double>(scanned_ports) / elapsed.count();
+        return static_cast<double>(
+            scanned_ports.load(std::memory_order_relaxed)) / elapsed.count();
     }
 };
 
 // ============================================================================
-// Token Bucket for rate limiting
-// ============================================================================
-
-class TokenBucket {
-public:
-    explicit TokenBucket(size_t rate_per_second) 
-        : rate_(rate_per_second), tokens_(rate_per_second) {
-        last_refill_ = std::chrono::steady_clock::now();
-    }
-    
-    bool consume(size_t tokens = 1) {
-        std::lock_guard<std::mutex> lock(mutex_);
-        refill();
-        
-        if (tokens_ >= tokens) {
-            tokens_ -= tokens;
-            return true;
-        }
-        
-        // Not enough tokens, calculate wait time
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - last_refill_);
-        double need_us = (1000000.0 * tokens) / rate_;
-        
-        if (elapsed.count() < need_us) {
-            auto wait_us = static_cast<long>(need_us - elapsed.count());
-            std::this_thread::sleep_for(std::chrono::microseconds(wait_us));
-        }
-        
-        refill();
-        if (tokens_ >= tokens) {
-            tokens_ -= tokens;
-            return true;
-        }
-        
-        return false;
-    }
-
-private:
-    size_t rate_;
-    size_t tokens_;
-    std::chrono::time_point<std::chrono::steady_clock> last_refill_;
-    std::mutex mutex_;
-    
-    void refill() {
-        auto now = std::chrono::steady_clock::now();
-        auto elapsed = std::chrono::duration_cast<std::chrono::microseconds>(now - last_refill_);
-        
-        size_t new_tokens = (elapsed.count() * rate_) / 1000000;
-        if (new_tokens > 0) {
-            tokens_ = std::min(tokens_ + new_tokens, rate_);
-            last_refill_ = now;
-        }
-    }
-};
-
-// ============================================================================
-// Thread Pool with modern C++ features
-// ============================================================================
-
-class ThreadPool {
-public:
-    explicit ThreadPool(size_t num_threads) 
-        : stop_(false) {
-        
-        // Set thread names for debugging
-        for (size_t i = 0; i < num_threads; ++i) {
-            workers_.emplace_back([this, i] {
-                while (true) {
-                    std::function<void()> task;
-                    {
-                        std::unique_lock<std::mutex> lock(queue_mutex_);
-                        condition_.wait(lock, [this] { 
-                            return stop_ || !tasks_.empty(); 
-                        });
-                        
-                        if (stop_ && tasks_.empty()) {
-                            return;
-                        }
-                        
-                        task = std::move(tasks_.front());
-                        tasks_.pop();
-                    }
-                    
-                    try {
-                        task();
-                    } catch (const std::exception& e) {
-                        std::cerr << "Thread pool task exception: " << e.what() << std::endl;
-                    }
-                }
-            });
-        }
-    }
-
-    template<class F, class... Args>
-    auto enqueue(F&& f, Args&&... args) 
-        -> std::future<typename std::invoke_result_t<F, Args...>> {
-        
-        using return_type = typename std::invoke_result_t<F, Args...>;
-        
-        auto task = std::make_shared<std::packaged_task<return_type()>>(
-            std::bind(std::forward<F>(f), std::forward<Args>(args)...)
-        );
-        
-        std::future<return_type> result = task->get_future();
-        
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            if (stop_) {
-                throw std::runtime_error("enqueue on stopped ThreadPool");
-            }
-            tasks_.emplace([task]() { (*task)(); });
-        }
-        condition_.notify_one();
-        return result;
-    }
-    
-    size_t pending_tasks() const {
-        std::lock_guard<std::mutex> lock(queue_mutex_);
-        return tasks_.size();
-    }
-    
-    ~ThreadPool() {
-        {
-            std::unique_lock<std::mutex> lock(queue_mutex_);
-            stop_ = true;
-        }
-        condition_.notify_all();
-        
-        for (std::thread& worker : workers_) {
-            if (worker.joinable()) {
-                worker.join();
-            }
-        }
-    }
-
-private:
-    std::vector<std::thread> workers_;
-    std::queue<std::function<void()>> tasks_;
-    mutable std::mutex queue_mutex_;
-    std::condition_variable condition_;
-    bool stop_;
-};
-
-// ============================================================================
-// TCP Pseudo Header for checksum calculation
+// TCP pseudo-header (GCC packed; Linux-only tool — acceptable)
 // ============================================================================
 
 struct PseudoHeader {
     uint32_t src_addr;
     uint32_t dst_addr;
-    uint8_t zero;
-    uint8_t protocol;
+    uint8_t  zero;
+    uint8_t  protocol;
     uint16_t tcp_len;
 } __attribute__((packed));
 
 // ============================================================================
-// Main Scanner Class
+// FIX-14 — Thread-safe timestamp
+// ============================================================================
+
+static std::string current_time_ts() {
+    auto t = std::chrono::system_clock::to_time_t(
+                 std::chrono::system_clock::now());
+    struct tm tm_buf{};
+    localtime_r(&t, &tm_buf);
+    std::ostringstream ss;
+    ss << std::put_time(&tm_buf, "%Y-%m-%d %H:%M:%S");
+    return ss.str();
+}
+
+// ============================================================================
+// FIX-26 — Bounds-checked IP header offset helper
+// ============================================================================
+
+// Returns pointer to the transport header (TCP/ICMP) that begins after the
+// IP header, or nullptr if the packet is too short.
+template<typename TransportHdr>
+static const TransportHdr* ihl_cast(const char* buf, int bytes) {
+    if (bytes < static_cast<int>(sizeof(struct iphdr))) return nullptr;
+    const auto* ip  = reinterpret_cast<const struct iphdr*>(buf);
+    int ip_len = static_cast<int>(ip->ihl) * 4;
+    if (ip_len < static_cast<int>(sizeof(struct iphdr))) return nullptr;
+    if (bytes < ip_len + static_cast<int>(sizeof(TransportHdr))) return nullptr;
+    return reinterpret_cast<const TransportHdr*>(buf + ip_len);
+}
+
+// ============================================================================
+// Main Scanner
 // ============================================================================
 
 class Sentinel {
 public:
-    explicit Sentinel(ScanOptions options) 
-        : opts_(std::move(options))
-        , pool_(opts_.num_threads > 0 ? opts_.num_threads : std::thread::hardware_concurrency() * 2)
-        , token_bucket_(opts_.rate_limit > 0 ? opts_.rate_limit : 1000000) {
-        
+    explicit Sentinel(ScanOptions opts)
+        : opts_(std::move(opts))
+        , last_progress_pct_(-1)
+        , next_src_port_(EPH_PORT_BASE)  // FIX-30
+    {
+        // FIX-35: validate and normalise options before anything else
+        validate_options();
+
+        pool_ = std::make_unique<ThreadPool>(
+            static_cast<size_t>(opts_.num_threads));
+        if (opts_.rate_limit > 0)
+            token_bucket_ = std::make_unique<TokenBucket>(
+                static_cast<size_t>(opts_.rate_limit));
+
         initialize();
     }
-    
-    ~Sentinel() {
-        cleanup();
-    }
-    
+
     void scan() {
-        try {
-            stats_.reset();
-            stats_.start_time = std::chrono::steady_clock::now();
-            
-            print_banner();
-            
-            if (opts_.icmp_ping) {
-                perform_ping_sweep();
-            }
-            
-            setup_signal_handler();
-            
-            std::cout << "\n[+] Starting scan of " << targets_.size() 
-                      << " target(s) for " << ports_.size() << " ports" << std::endl;
-            std::cout << "[+] Using " << pool_.pending_tasks() << " threads" << std::endl;
-            
-            if (opts_.rate_limit > 0) {
-                std::cout << "[+] Rate limit: " << opts_.rate_limit << " packets/sec" << std::endl;
-            }
-            
-            stats_.total_ports = targets_.size() * ports_.size();
-            
-            // Batch processing for better performance
-            const size_t BATCH_SIZE = 250;
-            std::vector<std::pair<std::string, int>> batch;
-            std::vector<std::future<void>> futures;
-            
-            for (const auto& target : targets_) {
-                for (int port : ports_) {
-                    if (should_exclude_port(port)) continue;
-                    
-                    batch.emplace_back(target, port);
-                    
-                    if (batch.size() >= BATCH_SIZE) {
-                        submit_batch(batch, futures);
-                        batch.clear();
-                    }
+        stats_.reset();
+        print_banner();
+
+        // FIX-28: signal handler installed BEFORE ping sweep
+        setup_signal_handler();
+
+        if (opts_.icmp_ping)
+            perform_ping_sweep();
+
+        {
+            std::lock_guard<std::mutex> lk(io_mutex_);
+            std::cout << "\n[+] Scanning " << targets_.size()
+                      << " target(s), " << ports_.size() << " port(s)\n"
+                      << "[+] Threads:  " << opts_.num_threads << '\n';
+            if (opts_.rate_limit > 0)
+                std::cout << "[+] Rate:     " << opts_.rate_limit << " pps\n";
+        }
+
+        stats_.total_ports =
+            static_cast<uint64_t>(targets_.size()) * ports_.size();
+
+        // FIX-36: backpressure cap = threads * 4
+        const size_t MAX_PENDING =
+            static_cast<size_t>(opts_.num_threads) * 4;
+        const size_t BATCH = 250;
+
+        std::vector<std::pair<std::string,int>> batch;
+        std::vector<std::future<void>>          futures;
+
+        for (const auto& tgt : targets_) {
+            for (int p : ports_) {
+                if (should_exclude(p)) continue;
+                batch.emplace_back(tgt, p);
+                if (batch.size() >= BATCH) {
+                    submit_batch(batch, futures, MAX_PENDING);
+                    batch.clear();
                 }
             }
-            
-            if (!batch.empty()) {
-                submit_batch(batch, futures);
-            }
-            
-            // Wait for all tasks to complete
-            for (auto& f : futures) {
-                f.get();
-            }
-            
-            stats_.end_time = std::chrono::steady_clock::now();
-            
-            print_statistics();
-            save_results();
-            
-        } catch (const std::exception& e) {
-            std::cerr << "\n[!] Scan error: " << e.what() << std::endl;
         }
+        if (!batch.empty())
+            submit_batch(batch, futures, MAX_PENDING);
+
+        for (auto& f : futures) {
+            try { f.get(); }
+            catch (const std::exception& e) {
+                std::lock_guard<std::mutex> lk(io_mutex_);
+                std::cerr << "[!] Batch error: " << e.what() << '\n';
+            }
+        }
+
+        stats_.end_time.set(std::chrono::steady_clock::now());
+        print_statistics();
+        save_results();
     }
-    
+
     void stop() {
-        g_stop_signal = true;
+        g_stop_signal.store(true, std::memory_order_release);
     }
 
 private:
-    ScanOptions opts_;
-    ThreadPool pool_;
-    TokenBucket token_bucket_;
-    ScanStatistics stats_;
-    
-    std::vector<std::string> targets_;
-    std::vector<int> ports_;
-    std::vector<ScanResult> results_;
-    std::mutex results_mutex_;
-    std::atomic<int> active_batches_{0};
-    std::condition_variable batches_done_cv_;
-    
-    // Service signatures
-    const std::map<int, std::string> service_signatures_ = {
-        {20, "FTP-data"}, {21, "FTP"}, {22, "SSH"}, {23, "Telnet"},
-        {25, "SMTP"}, {53, "DNS"}, {67, "DHCP"}, {68, "DHCP"},
-        {69, "TFTP"}, {80, "HTTP"}, {110, "POP3"}, {111, "RPC"},
-        {123, "NTP"}, {135, "MSRPC"}, {137, "NetBIOS"}, {138, "NetBIOS"},
-        {139, "NetBIOS"}, {143, "IMAP"}, {161, "SNMP"}, {162, "SNMP"},
-        {179, "BGP"}, {389, "LDAP"}, {443, "HTTPS"}, {445, "SMB"},
-        {465, "SMTPS"}, {514, "Syslog"}, {515, "LPD"}, {587, "SMTP"},
-        {631, "IPP"}, {636, "LDAPS"}, {873, "Rsync"}, {989, "FTP-data"},
-        {990, "FTP"}, {993, "IMAPS"}, {995, "POP3S"}, {1080, "SOCKS"},
-        {1194, "OpenVPN"}, {1433, "MSSQL"}, {1521, "Oracle"}, {1701, "L2TP"},
-        {1723, "PPTP"}, {1812, "RADIUS"}, {1813, "RADIUS"}, {2049, "NFS"},
-        {2082, "cPanel"}, {2083, "cPanel"}, {2086, "WHM"}, {2087, "WHM"},
-        {2181, "ZooKeeper"}, {2375, "Docker"}, {2376, "Docker"}, {2483, "Oracle"},
-        {2484, "Oracle"}, {3128, "Squid"}, {3260, "iSCSI"}, {3306, "MySQL"},
-        {3389, "RDP"}, {3690, "SVN"}, {4333, "SQL"}, {4444, "Metasploit"},
-        {4500, "IPsec"}, {4567, "Cassandra"}, {5000, "UPnP"}, {5001, "UPnP"},
-        {5060, "SIP"}, {5061, "SIP"}, {5143, "Redis"}, {5222, "XMPP"},
-        {5223, "XMPP"}, {5269, "XMPP"}, {5432, "PostgreSQL"}, {5555, "Android"},
-        {5631, "pcAnywhere"}, {5632, "pcAnywhere"}, {5800, "VNC"}, {5900, "VNC"},
-        {5901, "VNC"}, {5902, "VNC"}, {5984, "CouchDB"}, {6000, "X11"},
-        {6001, "X11"}, {6379, "Redis"}, {6660, "IRC"}, {6661, "IRC"},
-        {6662, "IRC"}, {6663, "IRC"}, {6664, "IRC"}, {6665, "IRC"},
-        {6666, "IRC"}, {6667, "IRC"}, {6668, "IRC"}, {6669, "IRC"},
-        {7000, "Cassandra"}, {7001, "Cassandra"}, {7199, "Cassandra"},
-        {8000, "HTTP"}, {8008, "HTTP"}, {8009, "AJP"}, {8010, "HTTP"},
-        {8042, "Hadoop"}, {8080, "HTTP-Alt"}, {8081, "HTTP"}, {8082, "HTTP"},
-        {8086, "InfluxDB"}, {8087, "InfluxDB"}, {8088, "HTTP"}, {8090, "HTTP"},
-        {8140, "Puppet"}, {8181, "HTTP"}, {8443, "HTTPS-Alt"}, {8500, "Consul"},
-        {8600, "Consul"}, {8888, "HTTP"}, {8983, "Solr"}, {9000, "Hadoop"},
-        {9042, "Cassandra"}, {9092, "Kafka"}, {9100, "HP JetDirect"},
-        {9160, "Cassandra"}, {9200, "Elasticsearch"}, {9300, "Elasticsearch"},
-        {9418, "Git"}, {9876, "Redis"}, {9999, "HTTP"}, {10000, "Webmin"},
-        {11211, "Memcached"}, {11214, "Memcached"}, {11215, "Memcached"},
-        {15672, "RabbitMQ"}, {15692, "RabbitMQ"}, {16010, "HBase"},
-        {16379, "Redis"}, {16579, "Redis"}, {18080, "HTTP"}, {20000, "HTTP"},
-        {25565, "Minecraft"}, {27017, "MongoDB"}, {27018, "MongoDB"},
-        {27019, "MongoDB"}, {28017, "MongoDB"}, {30718, "Redis"},
-        {34701, "Redis"}, {50000, "SAP"}, {50070, "Hadoop"}, {50075, "Hadoop"},
-        {50090, "Hadoop"}, {60000, "Redis"}, {60010, "HBase"}, {61613, "Redis"},
-        {61614, "Redis"}
+    ScanOptions                    opts_;
+    std::unique_ptr<ThreadPool>    pool_;
+    std::unique_ptr<TokenBucket>   token_bucket_;
+    ScanStatistics                 stats_;
+    std::vector<std::string>       targets_;
+    std::vector<int>               ports_;
+    std::vector<ScanResult>        results_;
+    mutable std::mutex             io_mutex_;
+    std::atomic<int>               last_progress_pct_;
+    // FIX-30: collision-free ephemeral port allocation
+    std::atomic<uint16_t>          next_src_port_;
+
+    // ── service map ──────────────────────────────────────────────────────────
+
+    const std::map<int,std::string> svc_ = {
+        {20,"FTP-data"},{21,"FTP"},{22,"SSH"},{23,"Telnet"},
+        {25,"SMTP"},{53,"DNS"},{67,"DHCP"},{68,"DHCP"},
+        {69,"TFTP"},{80,"HTTP"},{110,"POP3"},{111,"RPC"},
+        {123,"NTP"},{135,"MSRPC"},{137,"NetBIOS"},{138,"NetBIOS"},
+        {139,"NetBIOS"},{143,"IMAP"},{161,"SNMP"},{162,"SNMP"},
+        {179,"BGP"},{389,"LDAP"},{443,"HTTPS"},{445,"SMB"},
+        {465,"SMTPS"},{514,"Syslog"},{515,"LPD"},{587,"SMTP"},
+        {631,"IPP"},{636,"LDAPS"},{873,"Rsync"},
+        {993,"IMAPS"},{995,"POP3S"},{1080,"SOCKS"},
+        {1194,"OpenVPN"},{1433,"MSSQL"},{1521,"Oracle"},
+        {1701,"L2TP"},{1723,"PPTP"},{1812,"RADIUS"},{1813,"RADIUS"},
+        {2049,"NFS"},{2181,"ZooKeeper"},{2375,"Docker"},{2376,"Docker"},
+        {3128,"Squid"},{3306,"MySQL"},{3389,"RDP"},{3690,"SVN"},
+        {4444,"Metasploit"},{4500,"IPsec"},{5060,"SIP"},{5061,"SIP"},
+        {5222,"XMPP"},{5432,"PostgreSQL"},{5800,"VNC"},{5900,"VNC"},
+        {5984,"CouchDB"},{6000,"X11"},{6379,"Redis"},
+        {6667,"IRC"},{7000,"Cassandra"},{8080,"HTTP-Alt"},
+        {8443,"HTTPS-Alt"},{8500,"Consul"},{9000,"Hadoop"},
+        {9092,"Kafka"},{9200,"Elasticsearch"},{9300,"Elasticsearch"},
+        {9418,"Git"},{10000,"Webmin"},{11211,"Memcached"},
+        {15672,"RabbitMQ"},{27017,"MongoDB"},{50070,"Hadoop"},
     };
-    
-    // ========================================================================
-    // Initialization
-    // ========================================================================
-    
+
+    struct VulnRecord {
+        std::string service;
+        std::string banner_prefix;
+        std::string cve_id;
+        std::string description;
+    };
+
+    const std::vector<VulnRecord> vuln_db_ = {
+        {"SSH",  "SSH-2.0-OpenSSH_7.2", "CVE-2016-6210",
+         "OpenSSH 7.2 username enumeration via timing side-channel"},
+        {"SSH",  "SSH-2.0-OpenSSH_7.1", "CVE-2016-0777",
+         "OpenSSH < 7.2 roaming info leak (UseRoaming)"},
+        {"HTTP", "Apache/2.4.49",       "CVE-2021-41773",
+         "Apache 2.4.49 path-traversal/RCE"},
+        {"HTTP", "Apache/2.4.50",       "CVE-2021-42013",
+         "Apache 2.4.50 path-traversal bypass of CVE-2021-41773"},
+        {"FTP",  "220 ProFTPD 1.3.5",   "CVE-2015-3306",
+         "ProFTPD 1.3.5 mod_copy unauthenticated file copy"},
+        {"SMTP", "220 Exim 4.87",       "CVE-2017-16943",
+         "Exim 4.87 use-after-free in string_format"},
+    };
+
+    // ── FIX-35: validate / normalise options ─────────────────────────────────
+
+    void validate_options() {
+        if (opts_.timeout_ms < MIN_TIMEOUT_MS)
+            opts_.timeout_ms = MIN_TIMEOUT_MS;
+        if (opts_.timeout_ms > MAX_TIMEOUT_MS)
+            opts_.timeout_ms = MAX_TIMEOUT_MS;
+
+        if (opts_.num_threads <= 0)
+            opts_.num_threads = static_cast<int>(
+                std::thread::hardware_concurrency() * 2);
+        if (opts_.num_threads < 1)    opts_.num_threads = 1;
+        if (opts_.num_threads > MAX_THREADS) opts_.num_threads = MAX_THREADS;
+
+        if (opts_.scan_interval_sec <= 0) opts_.scan_interval_sec = 60;
+    }
+
+    // ── initialisation ───────────────────────────────────────────────────────
+
     void initialize() {
-        validate_targets();
-        parse_port_ranges();
-        expand_targets();
-        
-        if (opts_.randomize_ports) {
-            shuffle_ports();
-        }
-        
-        if (opts_.verbose) {
-            std::cout << "[Debug] Initialized with " << targets_.size() 
-                      << " targets and " << ports_.size() << " ports" << std::endl;
-        }
-    }
-    
-    void cleanup() {
-        // Close any open sockets, free resources
-    }
-    
-    void validate_targets() {
-        if (opts_.targets.empty()) {
+        if (opts_.targets.empty())
             throw std::runtime_error("No targets specified");
-        }
+        expand_targets();
+        parse_port_ranges();
+        if (opts_.randomize_ports)
+            std::shuffle(ports_.begin(), ports_.end(), ThreadRng::engine);
     }
-    
+
     void expand_targets() {
-        for (const auto& target : opts_.targets) {
-            if (target.find('/') != std::string::npos && opts_.cidr_support) {
-                auto expanded = expand_cidr(target);
-                targets_.insert(targets_.end(), expanded.begin(), expanded.end());
+        for (const auto& t : opts_.targets) {
+            if (t.find('/') != std::string::npos && opts_.cidr_support) {
+                auto hosts = expand_cidr(t);
+                targets_.insert(targets_.end(), hosts.begin(), hosts.end());
+            } else if (is_valid_ip(t)) {
+                targets_.push_back(t);
             } else {
-                if (is_valid_ip(target)) {
-                    targets_.push_back(target);
-                } else {
-                    std::cerr << "[!] Warning: Invalid IP address: " << target << std::endl;
-                }
+                std::lock_guard<std::mutex> lk(io_mutex_);
+                std::cerr << "[!] Invalid IP, skipping: " << t << '\n';
             }
         }
-        
-        if (targets_.empty()) {
+        if (targets_.empty())
             throw std::runtime_error("No valid targets found");
-        }
     }
-    
+
+    // FIX-20 + FIX-27
     std::vector<std::string> expand_cidr(const std::string& cidr) {
         std::vector<std::string> result;
-        
-        size_t slash_pos = cidr.find('/');
-        if (slash_pos == std::string::npos) {
-            result.push_back(cidr);
-            return result;
-        }
-        
-        std::string base_ip = cidr.substr(0, slash_pos);
-        int prefix = std::stoi(cidr.substr(slash_pos + 1));
-        
+        auto slash = cidr.find('/');
+        if (slash == std::string::npos) { result.push_back(cidr); return result; }
+
+        std::string base = cidr.substr(0, slash);
+        int prefix = 0;
+        try { prefix = std::stoi(cidr.substr(slash + 1)); }
+        catch (...) { return result; }
         if (prefix < 0 || prefix > 32) return result;
-        
-        struct in_addr addr;
-        if (inet_pton(AF_INET, base_ip.c_str(), &addr) != 1) {
-            return result;
+
+        struct in_addr addr{};
+        if (inet_pton(AF_INET, base.c_str(), &addr) != 1) return result;
+
+        uint32_t ip    = ntohl(addr.s_addr);
+        uint32_t mask  = (prefix == 0) ? 0u : ~((1u << (32 - prefix)) - 1u);
+        uint32_t net   = ip & mask;
+        uint32_t bcast = net | ~mask;
+
+        auto push = [&](uint32_t h) {
+            struct in_addr ha{};
+            ha.s_addr = htonl(h);
+            char buf[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ha, buf, sizeof(buf));
+            result.emplace_back(buf);
+        };
+
+        if (prefix == 32) { push(net);  return result; }
+        if (prefix == 31) { push(net); push(bcast); return result; }
+
+        // FIX-27: cap expansion to prevent billion-entry allocation
+        uint32_t host_count = bcast - net - 1;
+        if (host_count > MAX_CIDR_HOSTS) {
+            std::cerr << "[!] CIDR /" << prefix
+                      << " has " << host_count
+                      << " hosts; capped at " << MAX_CIDR_HOSTS << '\n';
+            host_count = static_cast<uint32_t>(MAX_CIDR_HOSTS);
         }
-        
-        uint32_t ip = ntohl(addr.s_addr);
-        uint32_t mask = prefix == 0 ? 0 : ~((1 << (32 - prefix)) - 1);
-        uint32_t network = ip & mask;
-        uint32_t broadcast = network | ~mask;
-        
-        uint32_t host_min = network + 1;
-        uint32_t host_max = broadcast - 1;
-        
-        for (uint32_t host = host_min; host <= host_max; ++host) {
-            struct in_addr host_addr;
-            host_addr.s_addr = htonl(host);
-            result.push_back(inet_ntoa(host_addr));
-        }
-        
+        for (uint32_t i = 0; i < host_count; ++i)
+            push(net + 1 + i);
+
         return result;
     }
-    
-    bool is_valid_ip(const std::string& ip) {
-        struct sockaddr_in sa;
-        struct sockaddr_in6 sa6;
-        
-        return (inet_pton(AF_INET, ip.c_str(), &sa) == 1) ||
-               (inet_pton(AF_INET6, ip.c_str(), &sa6) == 1);
+
+    static bool is_valid_ip(const std::string& ip) {
+        struct in_addr  a4{};
+        struct in6_addr a6{};
+        return inet_pton(AF_INET,  ip.c_str(), &a4) == 1 ||
+               inet_pton(AF_INET6, ip.c_str(), &a6) == 1;
     }
-    
+
     void parse_port_ranges() {
         if (!opts_.ports.empty()) {
             ports_ = opts_.ports;
         } else {
-            for (int port = opts_.start_port; port <= opts_.end_port; ++port) {
-                if (port > 0 && port <= 65535) {
-                    ports_.push_back(port);
-                }
-            }
+            for (int p = opts_.start_port; p <= opts_.end_port; ++p)
+                if (p > 0 && p <= 65535) ports_.push_back(p);
         }
-        
-        // Remove duplicates
         std::sort(ports_.begin(), ports_.end());
         ports_.erase(std::unique(ports_.begin(), ports_.end()), ports_.end());
     }
-    
-    void shuffle_ports() {
-        std::random_device rd;
-        std::mt19937 g(rd());
-        std::shuffle(ports_.begin(), ports_.end(), g);
-    }
-    
-    bool should_exclude_port(int port) {
-        return std::find(opts_.exclude_ports.begin(), opts_.exclude_ports.end(), port) 
+
+    bool should_exclude(int p) const {
+        return std::find(opts_.exclude_ports.begin(),
+                         opts_.exclude_ports.end(), p)
                != opts_.exclude_ports.end();
     }
-    
+
+    // FIX-28 + FIX-29
     void setup_signal_handler() {
-        struct sigaction sa;
-        sa.sa_handler = [](int) { 
-            g_stop_signal = true; 
-            std::cout << "\n[!] Received interrupt signal. Stopping gracefully..." << std::endl;
+        struct sigaction sa{};
+        sa.sa_handler = [](int) {
+            // FIX-29: release order ensures prompt cross-thread visibility
+            g_stop_signal.store(true, std::memory_order_release);
+            const char msg[] = "\n[!] Interrupted. Stopping...\n";
+            ::write(STDERR_FILENO, msg, sizeof(msg) - 1);
         };
         sigemptyset(&sa.sa_mask);
-        sa.sa_flags = 0;
-        sigaction(SIGINT, &sa, nullptr);
+        sa.sa_flags = SA_RESTART;
+        sigaction(SIGINT,  &sa, nullptr);
         sigaction(SIGTERM, &sa, nullptr);
     }
-    
-    // ========================================================================
-    // Ping Sweep
-    // ========================================================================
-    
+
+    // ── FIX-21: ICMP ping with source validation + unique ID ─────────────────
+
     void perform_ping_sweep() {
-        std::cout << "\n[*] Performing ICMP ping sweep..." << std::endl;
-        
-        std::vector<std::string> alive_hosts;
-        std::mutex alive_mutex;
-        std::vector<std::future<void>> futures;
-        
-        for (const auto& target : targets_) {
-            futures.push_back(pool_.enqueue([this, target, &alive_hosts, &alive_mutex]() {
-                if (icmp_ping(target)) {
-                    std::lock_guard<std::mutex> lock(alive_mutex);
-                    alive_hosts.push_back(target);
-                    
-                    if (opts_.verbose) {
-                        std::cout << "  [+] Host " << target << " is up" << std::endl;
+        {
+            std::lock_guard<std::mutex> lk(io_mutex_);
+            std::cout << "\n[*] ICMP ping sweep...\n";
+        }
+
+        auto alive     = std::make_shared<std::vector<std::string>>();
+        auto alive_mtx = std::make_shared<std::mutex>();
+
+        std::vector<std::future<void>> futs;
+        futs.reserve(targets_.size());
+
+        for (const auto& t : targets_) {
+            futs.push_back(pool_->enqueue(
+                [this, t, alive, alive_mtx] {
+                    if (icmp_ping(t)) {
+                        {
+                            std::lock_guard<std::mutex> lk(*alive_mtx);
+                            alive->push_back(t);
+                        }
+                        if (opts_.verbose) {
+                            std::lock_guard<std::mutex> ilk(io_mutex_);
+                            std::cout << "  [+] " << t << " is up\n";
+                        }
                     }
-                } else if (opts_.verbose) {
-                    std::cout << "  [-] Host " << target << " is down" << std::endl;
-                }
-            }));
+                },
+                static_cast<size_t>(opts_.num_threads) * 4
+            ));
         }
-        
-        for (auto& f : futures) {
-            f.get();
+
+        std::exception_ptr first_exc;
+        for (auto& f : futs) {
+            try { f.get(); }
+            catch (...) { if (!first_exc) first_exc = std::current_exception(); }
         }
-        
-        if (!alive_hosts.empty()) {
-            targets_ = alive_hosts;
-            std::cout << "[+] " << targets_.size() << " hosts are up" << std::endl;
+        if (first_exc) std::rethrow_exception(first_exc);
+
+        std::lock_guard<std::mutex> lk(io_mutex_);
+        if (!alive->empty()) {
+            targets_ = *alive;
+            std::cout << "[+] " << targets_.size() << " host(s) up\n";
         } else {
-            std::cout << "[-] No hosts are up. Continuing scan anyway..." << std::endl;
+            std::cout << "[-] No hosts responded; continuing anyway...\n";
         }
     }
-    
+
+    // FIX-21 + FIX-26: source IP validated; unique per-thread echo ID;
+    //                   bounds-checked IP/ICMP header parsing
     bool icmp_ping(const std::string& target) {
         int sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-        if (sock < 0) {
-            if (opts_.verbose) {
-                std::cerr << "    [!] Raw socket failed (need root): " << strerror(errno) << std::endl;
-            }
-            return true; // Assume host is up
-        }
-        
-        // Set timeout
-        struct timeval tv;
-        tv.tv_sec = 1;
-        tv.tv_usec = 0;
+        if (sock < 0) return true; // no CAP_NET_RAW → assume up
+
+        struct timeval tv{1, 0};
         setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        
-        // Construct ICMP echo request
-        char packet[64] = {0};
-        struct icmphdr* icmp = (struct icmphdr*)packet;
-        icmp->type = ICMP_ECHO;
-        icmp->code = 0;
-        icmp->un.echo.id = htons(getpid() & 0xFFFF);
-        icmp->un.echo.sequence = htons(1);
-        icmp->checksum = 0;
-        icmp->checksum = icmp_checksum((unsigned short*)packet, sizeof(packet));
-        
-        struct sockaddr_in addr;
+
+        // FIX-21: unique echo ID per thread call to avoid cross-thread theft
+        uint16_t echo_id = ThreadRng::u16();
+
+        alignas(4) char packet[64]{};
+        auto* icm             = reinterpret_cast<struct icmphdr*>(packet);
+        icm->type             = ICMP_ECHO;
+        icm->code             = 0;
+        icm->un.echo.id       = htons(echo_id);
+        icm->un.echo.sequence = htons(1);
+        icm->checksum         = 0;
+        icm->checksum         = checksum(
+            reinterpret_cast<const uint16_t*>(packet),
+            static_cast<int>(sizeof(packet)));
+
+        struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        inet_pton(AF_INET, target.c_str(), &addr.sin_addr);
-        
-        // Send ping
-        if (sendto(sock, packet, sizeof(packet), 0, 
-                   (struct sockaddr*)&addr, sizeof(addr)) <= 0) {
+        if (inet_pton(AF_INET, target.c_str(), &addr.sin_addr) != 1) {
+            close(sock); return false;
+        }
+
+        if (sendto(sock, packet, sizeof(packet), 0,
+                   reinterpret_cast<struct sockaddr*>(&addr),
+                   sizeof(addr)) <= 0) {
+            close(sock); return true;
+        }
+
+        // Poll + read loop: discard non-matching replies
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            struct pollfd pfd{sock, POLLIN, 0};
+            if (poll(&pfd, 1, 1000) <= 0) break;
+
+            alignas(4) char buf[256]{};
+            struct sockaddr_in reply{};
+            socklen_t rlen = sizeof(reply);
+            int bytes = recvfrom(sock, buf, sizeof(buf), 0,
+                                 reinterpret_cast<struct sockaddr*>(&reply),
+                                 &rlen);
+            if (bytes <= 0) break;
+
+            // FIX-21: validate source IP
+            char src_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &reply.sin_addr, src_str, sizeof(src_str));
+            if (std::string(src_str) != target) continue;
+
+            // FIX-26: bounds-checked header access
+            const auto* rep = ihl_cast<struct icmphdr>(buf, bytes);
+            if (!rep) continue;
+
+            if (rep->type != ICMP_ECHOREPLY) continue;
+
+            // FIX-21: verify echo ID to reject stolen replies
+            if (ntohs(rep->un.echo.id) != echo_id) continue;
+
             close(sock);
             return true;
         }
-        
-        // Receive reply
-        char buffer[256];
-        struct sockaddr_in reply_addr;
-        socklen_t addr_len = sizeof(reply_addr);
-        
-        int bytes = recvfrom(sock, buffer, sizeof(buffer), 0, 
-                             (struct sockaddr*)&reply_addr, &addr_len);
-        
+
         close(sock);
-        
-        if (bytes > 0) {
-            struct iphdr* ip = (struct iphdr*)buffer;
-            struct icmphdr* icmp_reply = (struct icmphdr*)(buffer + (ip->ihl * 4));
-            
-            return (icmp_reply->type == ICMP_ECHOREPLY);
-        }
-        
         return false;
     }
-    
-    unsigned short icmp_checksum(unsigned short* buf, int len) {
-        unsigned long sum = 0;
-        
-        while (len > 1) {
-            sum += *buf++;
-            len -= 2;
-        }
-        
-        if (len == 1) {
-            sum += *(unsigned char*)buf;
-        }
-        
-        sum = (sum >> 16) + (sum & 0xFFFF);
-        sum += (sum >> 16);
-        
-        return (unsigned short)(~sum);
-    }
-    
-    // ========================================================================
-    // Source IP discovery
-    // ========================================================================
-    
+
+    // ── source IP discovery ──────────────────────────────────────────────────
+
     uint32_t discover_source_ip(const std::string& target) {
         int sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (sock < 0) {
-            return INADDR_ANY;
-        }
-        
-        struct sockaddr_in addr;
+        if (sock < 0) return INADDR_ANY;
+
+        struct sockaddr_in addr{};
         addr.sin_family = AF_INET;
-        addr.sin_port = htons(53); // DNS port
-        inet_pton(AF_INET, target.c_str(), &addr.sin_addr);
-        
-        // Connect to target (doesn't send any data)
-        if (connect(sock, (struct sockaddr*)&addr, sizeof(addr)) < 0) {
-            close(sock);
-            return INADDR_ANY;
+        addr.sin_port   = htons(53);
+        if (inet_pton(AF_INET, target.c_str(), &addr.sin_addr) != 1) {
+            close(sock); return INADDR_ANY;
         }
-        
-        struct sockaddr_in local_addr;
-        socklen_t local_len = sizeof(local_addr);
-        
-        if (getsockname(sock, (struct sockaddr*)&local_addr, &local_len) < 0) {
-            close(sock);
-            return INADDR_ANY;
+        if (connect(sock, reinterpret_cast<struct sockaddr*>(&addr),
+                    sizeof(addr)) < 0) {
+            close(sock); return INADDR_ANY;
         }
-        
+        struct sockaddr_in local{};
+        socklen_t llen = sizeof(local);
+        getsockname(sock, reinterpret_cast<struct sockaddr*>(&local), &llen);
         close(sock);
-        return local_addr.sin_addr.s_addr;
-    }
-    
-    // ========================================================================
-    // Batch processing
-    // ========================================================================
-    
-    void submit_batch(const std::vector<std::pair<std::string, int>>& batch,
-                      std::vector<std::future<void>>& futures) {
-        
-        // Apply rate limiting
-        if (opts_.rate_limit > 0) {
-            token_bucket_.consume(batch.size());
-        }
-        
-        active_batches_++;
-        
-        futures.push_back(pool_.enqueue([this, batch]() {
-            for (const auto& [target, port] : batch) {
-                if (g_stop_signal) break;
-                
-                ScanResult result;
-                
-                try {
-                    if (opts_.syn_scan) {
-                        result = syn_scan_port(target, port);
-                    } else if (opts_.udp_scan) {
-                        result = udp_scan_port(target, port);
-                    } else {
-                        result = tcp_connect_scan(target, port);
-                    }
-                    
-                    update_statistics(result);
-                    
-                    if (result.status == "open" || opts_.verbose) {
-                        std::lock_guard<std::mutex> lock(results_mutex_);
-                        results_.push_back(result);
-                        
-                        if (opts_.verbose || result.status == "open") {
-                            print_result(result);
-                        }
-                    }
-                    
-                } catch (const std::exception& e) {
-                    stats_.errors++;
-                    if (opts_.verbose) {
-                        std::cerr << "    [!] Error scanning " << target << ":" 
-                                  << port << " - " << e.what() << std::endl;
-                    }
-                }
-                
-                stats_.scanned_ports++;
-                
-                if (opts_.verbose && stats_.scanned_ports % 100 == 0) {
-                    print_progress();
-                }
-            }
-            
-            active_batches_--;
-            batches_done_cv_.notify_one();
-        }));
-    }
-    
-    // ========================================================================
-    // TCP Connect Scan
-    // ========================================================================
-    
-    ScanResult tcp_connect_scan(const std::string& target, int port) {
-        ScanResult result;
-        result.target = target;
-        result.port = port;
-        result.protocol = "tcp";
-        result.timestamp = std::chrono::system_clock::now();
-        
-        auto start = std::chrono::steady_clock::now();
-        
-        int sock = socket(AF_INET, SOCK_STREAM, 0);
-        if (sock < 0) {
-            stats_.errors++;
-            return result;
-        }
-        
-        // Set non-blocking
-        int flags = fcntl(sock, F_GETFL, 0);
-        fcntl(sock, F_SETFL, flags | O_NONBLOCK);
-        
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        inet_pton(AF_INET, target.c_str(), &addr.sin_addr);
-        
-        connect(sock, (struct sockaddr*)&addr, sizeof(addr));
-        
-        struct pollfd pfd;
-        pfd.fd = sock;
-        pfd.events = POLLOUT;
-        
-        int poll_res = poll(&pfd, 1, opts_.timeout_ms);
-        
-        auto end = std::chrono::steady_clock::now();
-        result.response_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-        
-        if (poll_res > 0 && (pfd.revents & POLLOUT)) {
-            int so_error;
-            socklen_t len = sizeof(so_error);
-            getsockopt(sock, SOL_SOCKET, SO_ERROR, &so_error, &len);
-            
-            if (so_error == 0) {
-                result.status = "open";
-                result.ttl = get_ttl(sock);
-                result.os_hint = detect_os(result.ttl);
-                
-                if (opts_.service_detection) {
-                    result.service = detect_service(port);
-                }
-                
-                if (opts_.banner_grab) {
-                    result.banner = grab_banner(sock, port);
-                    
-                    if (opts_.vulnerability_check && !result.banner.empty()) {
-                        check_vulnerabilities(result);
-                    }
-                }
-                
-                if (opts_.reverse_dns) {
-                    result.hostname = reverse_dns(target);
-                }
-                
-                if (opts_.geoip) {
-                    // GeoIP lookup would go here
-                }
-                
-                if (opts_.mac_lookup) {
-                    // MAC lookup would go here
-                }
-            }
-        } else if (poll_res == 0) {
-            result.status = "timeout";
-            stats_.timeouts++;
-        } else {
-            result.status = "filtered";
-        }
-        
-        close(sock);
-        return result;
-    }
-    
-    // ========================================================================
-    // SYN Scan (Stealth)
-    // ========================================================================
-    
-    ScanResult syn_scan_port(const std::string& target, int port) {
-        ScanResult result;
-        result.target = target;
-        result.port = port;
-        result.protocol = "tcp";
-        result.status = "filtered";
-        result.timestamp = std::chrono::system_clock::now();
-        
-        // Send socket
-        int send_sock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
-        if (send_sock < 0) {
-            stats_.errors++;
-            return tcp_connect_scan(target, port); // Fallback
-        }
-        
-        // Receive socket
-        int recv_sock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
-        if (recv_sock < 0) {
-            close(send_sock);
-            stats_.errors++;
-            return tcp_connect_scan(target, port);
-        }
-        
-        int one = 1;
-        setsockopt(send_sock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
-        
-        // Discover source IP
-        uint32_t src_ip = discover_source_ip(target);
-        if (src_ip == INADDR_ANY) {
-            close(send_sock);
-            close(recv_sock);
-            return tcp_connect_scan(target, port);
-        }
-        
-        // Send SYN packet
-        auto start = std::chrono::steady_clock::now();
-        send_syn_packet(send_sock, src_ip, target, port);
-        
-        // Set receive timeout
-        struct timeval tv;
-        tv.tv_sec = 0;
-        tv.tv_usec = opts_.timeout_ms * 1000;
-        setsockopt(recv_sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-        
-        // Receive response
-        char buffer[256];
-        struct sockaddr_in reply_addr;
-        socklen_t addr_len = sizeof(reply_addr);
-        
-        int bytes = recvfrom(recv_sock, buffer, sizeof(buffer), 0,
-                             (struct sockaddr*)&reply_addr, &addr_len);
-        
-        auto end = std::chrono::steady_clock::now();
-        result.response_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-        
-        if (bytes > 0) {
-            struct iphdr* ip = (struct iphdr*)buffer;
-            struct tcphdr* tcp = (struct tcphdr*)(buffer + (ip->ihl * 4));
-            
-            if (tcp->syn && tcp->ack) {
-                result.status = "open";
-                result.ttl = ip->ttl;
-                result.os_hint = detect_os(result.ttl);
-                
-                // Send RST to close connection
-                send_rst_packet(send_sock, src_ip, target, port, tcp);
-                
-                if (opts_.service_detection) {
-                    result.service = detect_service(port);
-                }
-                
-                if (opts_.reverse_dns) {
-                    result.hostname = reverse_dns(target);
-                }
-                
-            } else if (tcp->rst) {
-                result.status = "closed";
-            }
-        } else if (errno == EAGAIN || errno == EWOULDBLOCK) {
-            result.status = "filtered";
-            stats_.timeouts++;
-        }
-        
-        close(send_sock);
-        close(recv_sock);
-        return result;
-    }
-    
-    void send_syn_packet(int sock, uint32_t src_ip, const std::string& dst_ip, int dst_port) {
-        char packet[sizeof(struct iphdr) + sizeof(struct tcphdr)] = {0};
-        
-        struct iphdr* ip = (struct iphdr*)packet;
-        struct tcphdr* tcp = (struct tcphdr*)(packet + sizeof(struct iphdr));
-        
-        // IP header
-        ip->ihl = 5;
-        ip->version = 4;
-        ip->tos = 0;
-        ip->tot_len = htons(sizeof(packet));
-        ip->id = htons(rand() & 0xFFFF);
-        ip->frag_off = 0;
-        ip->ttl = 64;
-        ip->protocol = IPPROTO_TCP;
-        ip->check = 0;
-        ip->saddr = src_ip;
-        inet_pton(AF_INET, dst_ip.c_str(), &ip->daddr);
-        
-        // TCP header
-        tcp->source = htons(12345 + (rand() % 10000));
-        tcp->dest = htons(dst_port);
-        tcp->seq = htonl(rand());
-        tcp->ack_seq = 0;
-        tcp->doff = 5;
-        tcp->syn = 1;
-        tcp->window = htons(5840);
-        tcp->check = 0;
-        tcp->urg_ptr = 0;
-        
-        // TCP checksum
-        tcp->check = tcp_checksum(ip, tcp);
-        
-        // IP checksum
-        ip->check = ip_checksum((unsigned short*)ip, sizeof(struct iphdr));
-        
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        inet_pton(AF_INET, dst_ip.c_str(), &addr.sin_addr);
-        
-        sendto(sock, packet, sizeof(packet), 0, (struct sockaddr*)&addr, sizeof(addr));
-    }
-    
-    void send_rst_packet(int sock, uint32_t src_ip, const std::string& dst_ip, 
-                         int dst_port, struct tcphdr* received_tcp) {
-        char packet[sizeof(struct iphdr) + sizeof(struct tcphdr)] = {0};
-        
-        struct iphdr* ip = (struct iphdr*)packet;
-        struct tcphdr* tcp = (struct tcphdr*)(packet + sizeof(struct iphdr));
-        
-        // IP header
-        ip->ihl = 5;
-        ip->version = 4;
-        ip->tos = 0;
-        ip->tot_len = htons(sizeof(packet));
-        ip->id = htons(rand() & 0xFFFF);
-        ip->frag_off = 0;
-        ip->ttl = 64;
-        ip->protocol = IPPROTO_TCP;
-        ip->check = 0;
-        ip->saddr = src_ip;
-        inet_pton(AF_INET, dst_ip.c_str(), &ip->daddr);
-        
-        // TCP header with RST
-        tcp->source = received_tcp->dest;
-        tcp->dest = received_tcp->source;
-        tcp->seq = received_tcp->ack_seq;
-        tcp->ack_seq = 0;
-        tcp->doff = 5;
-        tcp->rst = 1;
-        tcp->window = htons(5840);
-        
-        // Calculate checksums
-        tcp->check = tcp_checksum(ip, tcp);
-        ip->check = ip_checksum((unsigned short*)ip, sizeof(struct iphdr));
-        
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        inet_pton(AF_INET, dst_ip.c_str(), &addr.sin_addr);
-        
-        sendto(sock, packet, sizeof(packet), 0, (struct sockaddr*)&addr, sizeof(addr));
-    }
-    
-    // ========================================================================
-    // UDP Scan
-    // ========================================================================
-    
-    ScanResult udp_scan_port(const std::string& target, int port) {
-        ScanResult result;
-        result.target = target;
-        result.port = port;
-        result.protocol = "udp";
-        result.status = "open|filtered";
-        result.timestamp = std::chrono::system_clock::now();
-        
-        auto start = std::chrono::steady_clock::now();
-        
-        // UDP socket
-        int udp_sock = socket(AF_INET, SOCK_DGRAM, 0);
-        if (udp_sock < 0) {
-            stats_.errors++;
-            return result;
-        }
-        
-        // ICMP socket for unreachable messages
-        int icmp_sock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
-        if (icmp_sock < 0) {
-            close(udp_sock);
-            stats_.errors++;
-            return result;
-        }
-        
-        // Set non-blocking
-        fcntl(udp_sock, F_SETFL, O_NONBLOCK);
-        fcntl(icmp_sock, F_SETFL, O_NONBLOCK);
-        
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        addr.sin_port = htons(port);
-        inet_pton(AF_INET, target.c_str(), &addr.sin_addr);
-        
-        // Send empty UDP packet
-        sendto(udp_sock, NULL, 0, 0, (struct sockaddr*)&addr, sizeof(addr));
-        
-        // Poll for response
-        struct pollfd pfds[2];
-        pfds[0].fd = icmp_sock;
-        pfds[0].events = POLLIN;
-        pfds[1].fd = udp_sock;
-        pfds[1].events = POLLIN;
-        
-        int poll_res = poll(pfds, 2, opts_.timeout_ms);
-        
-        auto end = std::chrono::steady_clock::now();
-        result.response_time_ms = std::chrono::duration_cast<std::chrono::milliseconds>(end - start).count();
-        
-        if (poll_res > 0) {
-            if (pfds[0].revents & POLLIN) {
-                // ICMP response
-                char buffer[256];
-                struct sockaddr_in reply_addr;
-                socklen_t addr_len = sizeof(reply_addr);
-                
-                int bytes = recvfrom(icmp_sock, buffer, sizeof(buffer), 0,
-                                     (struct sockaddr*)&reply_addr, &addr_len);
-                
-                if (bytes > 0) {
-                    struct iphdr* ip = (struct iphdr*)buffer;
-                    struct icmphdr* icmp = (struct icmphdr*)(buffer + (ip->ihl * 4));
-                    
-                    // Port unreachable
-                    if (icmp->type == 3 && icmp->code == 3) {
-                        result.status = "closed";
-                        stats_.closed_ports++;
-                    }
-                }
-            }
-            
-            if (pfds[1].revents & POLLIN) {
-                // UDP response received
-                result.status = "open";
-                
-                if (opts_.service_detection) {
-                    result.service = detect_service(port);
-                }
-                
-                if (opts_.banner_grab) {
-                    char buffer[1024];
-                    int bytes = recv(udp_sock, buffer, sizeof(buffer) - 1, 0);
-                    if (bytes > 0) {
-                        buffer[bytes] = '\0';
-                        result.banner = buffer;
-                    }
-                }
-            }
-        } else if (poll_res == 0) {
-            stats_.timeouts++;
-        }
-        
-        close(udp_sock);
-        close(icmp_sock);
-        return result;
-    }
-    
-    // ========================================================================
-    // Checksum calculations
-    // ========================================================================
-    
-    unsigned short ip_checksum(unsigned short* buf, int len) {
-        unsigned long sum = 0;
-        
-        while (len > 1) {
-            sum += *buf++;
-            len -= 2;
-        }
-        
-        if (len == 1) {
-            sum += *(unsigned char*)buf;
-        }
-        
-        sum = (sum >> 16) + (sum & 0xFFFF);
-        sum += (sum >> 16);
-        
-        return (unsigned short)(~sum);
-    }
-    
-    unsigned short tcp_checksum(struct iphdr* ip, struct tcphdr* tcp) {
-        PseudoHeader psh;
-        psh.src_addr = ip->saddr;
-        psh.dst_addr = ip->daddr;
-        psh.zero = 0;
-        psh.protocol = IPPROTO_TCP;
-        psh.tcp_len = htons(sizeof(struct tcphdr));
-        
-        char pseudo_packet[sizeof(PseudoHeader) + sizeof(struct tcphdr)] = {0};
-        memcpy(pseudo_packet, &psh, sizeof(PseudoHeader));
-        memcpy(pseudo_packet + sizeof(PseudoHeader), tcp, sizeof(struct tcphdr));
-        
-        return ip_checksum((unsigned short*)pseudo_packet, sizeof(pseudo_packet));
-    }
-    
-    // ========================================================================
-    // Helper functions
-    // ========================================================================
-    
-    int get_ttl(int sock) {
-        struct sockaddr_in peer;
-        socklen_t peer_len = sizeof(peer);
-        if (getpeername(sock, (struct sockaddr*)&peer, &peer_len) == 0) {
-            // Can't get TTL directly from socket, would need raw socket
-            return 64; // Default guess
-        }
-        return 64;
-    }
-    
-    std::string detect_os(int ttl) {
-        if (ttl <= 64) return "Linux/Unix";
-        if (ttl <= 128) return "Windows";
-        if (ttl <= 255) return "Network Device";
-        return "Unknown";
-    }
-    
-    std::string detect_service(int port) {
-        auto it = service_signatures_.find(port);
-        if (it != service_signatures_.end()) {
-            return it->second;
-        }
-        return "unknown";
-    }
-    
-   std::string grab_banner(int sock, int port) {
-    // [DJ] Banner süresini TCP timeout ile aynı yapalım
-    int flags = fcntl(sock, F_GETFL, 0);
-    fcntl(sock, F_SETFL, flags & ~O_NONBLOCK);
-    
-    char buffer[4096] = {0};
-    
-    // Port'a özel probe
-    std::string probe;
-    if (port == 80 || port == 8080 || port == 8000) {
-        probe = "HEAD / HTTP/1.0\r\n\r\n";
-    } else if (port == 21) {
-        // FTP - just wait
-    } else if (port == 25) {
-        probe = "EHLO localhost\r\n";
-    } else if (port == 110) {
-        probe = "USER test\r\n";
-    } else if (port == 443) {
-        return "";  // HTTPS ayrı
-    } else if (port == 22) {
-        // SSH banner
-    } else {
-        probe = "\r\n";
-    }
-    
-    if (!probe.empty()) {
-        send(sock, probe.c_str(), probe.length(), 0);
-    }
-    
-    // Change the wait second
-    struct timeval tv;
-    tv.tv_sec = 0;
-    tv.tv_usec = opts_.timeout_ms * 1000;  // Ana timeout'u kullan!
-    setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
-    
-    int bytes = recv(sock, buffer, sizeof(buffer) - 1, 0);
-    if (bytes > 0) {
-        buffer[bytes] = '\0';
-        return clean_banner(buffer);
-    }
-    
-    return "";
-}
-    
-    std::string clean_banner(const std::string& banner) {
-        std::string result;
-        for (char c : banner) {
-            if (std::isprint(static_cast<unsigned char>(c)) || c == '\n' || c == '\r') {
-                result += c;
-            } else {
-                result += '.';
-            }
-        }
-        return result;
-    }
-    
-    std::string reverse_dns(const std::string& ip) {
-        struct sockaddr_in addr;
-        addr.sin_family = AF_INET;
-        inet_pton(AF_INET, ip.c_str(), &addr.sin_addr);
-        
-        char host[NI_MAXHOST];
-        if (getnameinfo((struct sockaddr*)&addr, sizeof(addr), 
-                        host, sizeof(host), NULL, 0, NI_NAMEREQD) == 0) {
-            return host;
-        }
-        
-        return "";
+        return local.sin_addr.s_addr;
     }
 
-// [DJ] Bu hissəni tələsik yazmışam, sonra düzəldəcəm
-// TODO: Real CVE database əlavə et
-// FIXME: Sadəcə nümunə üçündür
-    
-    void check_vulnerabilities(ScanResult& result) {
-        // Simple version-based vulnerability checks
-        if (result.service == "SSH" && !result.banner.empty()) {
-            if (result.banner.find("OpenSSH_7.2") != std::string::npos) {
-                result.banner += " [VULNERABLE: CVE-2016-6210]";
-            }
+    // ── FIX-30: collision-free ephemeral port ────────────────────────────────
+
+    uint16_t alloc_src_port() {
+        uint16_t offset = next_src_port_.fetch_add(1, std::memory_order_relaxed)
+                          % EPH_PORT_COUNT;
+        return static_cast<uint16_t>(EPH_PORT_BASE + offset);
+    }
+
+    // ── batch submission ─────────────────────────────────────────────────────
+
+    void submit_batch(const std::vector<std::pair<std::string,int>>& batch,
+                      std::vector<std::future<void>>& futures,
+                      size_t max_pending)
+    {
+        futures.push_back(pool_->enqueue(
+            [this, batch] {
+                for (const auto& [tgt, port] : batch) {
+                    if (g_stop_signal.load(std::memory_order_acquire)) break;
+
+                    if (token_bucket_)
+                        token_bucket_->consume_one();
+
+                    ScanResult res;
+                    try {
+                        if (opts_.syn_scan)      res = syn_scan(tgt, port);
+                        else if (opts_.udp_scan) res = udp_scan(tgt, port);
+                        else                     res = tcp_connect(tgt, port);
+
+                        update_stats(res);
+
+                        if (res.status == "open" || opts_.verbose) {
+                            std::lock_guard<std::mutex> lk(io_mutex_);
+                            results_.push_back(res);
+                            print_result_nolock(res);
+                        }
+                    } catch (const std::exception& e) {
+                        ++stats_.errors;
+                        if (opts_.verbose) {
+                            std::lock_guard<std::mutex> lk(io_mutex_);
+                            std::cerr << "    [!] " << tgt << ':' << port
+                                      << " – " << e.what() << '\n';
+                        }
+                    }
+                    ++stats_.scanned_ports;
+                    if (stats_.scanned_ports % 100 == 0) print_progress();
+                }
+            },
+            max_pending
+        ));
+    }
+
+    // ── FIX-23 + FIX-31: TCP connect scan ────────────────────────────────────
+
+    ScanResult tcp_connect(const std::string& tgt, int port) {
+        ScanResult r;
+        r.target    = tgt;
+        r.port      = port;
+        r.protocol  = "tcp";
+        r.timestamp = std::chrono::system_clock::now();
+
+        auto t0  = std::chrono::steady_clock::now();
+        int  sock = socket(AF_INET, SOCK_STREAM, 0);
+        if (sock < 0) { ++stats_.errors; return r; }
+
+        // FIX-23: check fcntl error
+        int fl = fcntl(sock, F_GETFL, 0);
+        if (fl < 0) {
+            close(sock);
+            ++stats_.errors;
+            return r;
         }
-        
-        if (result.service == "HTTP" && !result.banner.empty()) {
-            if (result.banner.find("Apache/2.4.49") != std::string::npos) {
-                result.banner += " [VULNERABLE: CVE-2021-41773]";
+        if (fcntl(sock, F_SETFL, fl | O_NONBLOCK) < 0) {
+            close(sock);
+            ++stats_.errors;
+            return r;
+        }
+
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(static_cast<uint16_t>(port));
+        if (inet_pton(AF_INET, tgt.c_str(), &addr.sin_addr) != 1) {
+            close(sock); ++stats_.errors; return r;
+        }
+
+        connect(sock, reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+
+        struct pollfd pfd{sock, POLLOUT | POLLERR | POLLHUP, 0};
+        int pr = poll(&pfd, 1, opts_.timeout_ms);
+
+        r.response_time_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+
+        // FIX-23: check POLLERR/POLLHUP explicitly before POLLOUT
+        if (pr > 0 && !(pfd.revents & (POLLERR | POLLHUP))
+                   &&  (pfd.revents & POLLOUT)) {
+            int err = 0;
+            socklen_t el = sizeof(err);
+            getsockopt(sock, SOL_SOCKET, SO_ERROR, &err, &el);
+
+            if (err == 0) {
+                r.status = "open";
+                // FIX-31: TTL unavailable on TCP connect socket; leave 0/"".
+                r.ttl     = 0;
+                r.os_hint = "";
+
+                if (opts_.service_detection) r.service  = lookup_service(port);
+                if (opts_.banner_grab)       r.banner   = grab_banner(sock, port);
+                if (opts_.vulnerability_check && !r.banner.empty())
+                    check_vulns(r);
+                if (opts_.reverse_dns)       r.hostname = rdns(tgt);
             }
+        } else if (pr == 0) {
+            r.status = "timeout";
+            ++stats_.timeouts;
+        } else {
+            r.status = "filtered";
+        }
+
+        close(sock);
+        return r;
+    }
+
+    // ── FIX-24 + FIX-26 + FIX-30: SYN scan ──────────────────────────────────
+
+    ScanResult syn_scan(const std::string& tgt, int port) {
+        ScanResult r;
+        r.target    = tgt;
+        r.port      = port;
+        r.protocol  = "tcp";
+        r.status    = "filtered";
+        r.timestamp = std::chrono::system_clock::now();
+
+        int ssock = socket(AF_INET, SOCK_RAW, IPPROTO_RAW);
+        int rsock = socket(AF_INET, SOCK_RAW, IPPROTO_TCP);
+        if (ssock < 0 || rsock < 0) {
+            if (ssock >= 0) close(ssock);
+            if (rsock >= 0) close(rsock);
+            ++stats_.errors;
+            return tcp_connect(tgt, port);
+        }
+
+        int one = 1;
+        setsockopt(ssock, IPPROTO_IP, IP_HDRINCL, &one, sizeof(one));
+
+        uint32_t src_ip = discover_source_ip(tgt);
+        if (src_ip == INADDR_ANY) {
+            close(ssock); close(rsock);
+            return tcp_connect(tgt, port);
+        }
+
+        // FIX-30: round-robin ephemeral port (no collision)
+        uint16_t src_port = alloc_src_port();
+        uint32_t seq_num  = ThreadRng::u32();
+
+        auto t0 = std::chrono::steady_clock::now();
+
+        // FIX-24: check inet_pton in send_syn
+        if (!send_syn(ssock, src_ip, tgt, src_port, port, seq_num)) {
+            close(ssock); close(rsock);
+            return tcp_connect(tgt, port);
+        }
+
+        struct timeval tv{0, static_cast<suseconds_t>(opts_.timeout_ms * 1000)};
+        setsockopt(rsock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        alignas(4) char buf[256]{};
+        bool timed_out = true;
+
+        for (int attempt = 0; attempt < 8; ++attempt) {
+            struct sockaddr_in ra{};
+            socklen_t rlen = sizeof(ra);
+            int bytes = recvfrom(rsock, buf, sizeof(buf), 0,
+                                 reinterpret_cast<struct sockaddr*>(&ra), &rlen);
+            if (bytes <= 0) break;
+
+            // Source IP check
+            char ra_str[INET_ADDRSTRLEN];
+            inet_ntop(AF_INET, &ra.sin_addr, ra_str, sizeof(ra_str));
+            if (std::string(ra_str) != tgt) continue;
+
+            // FIX-26: bounds-checked TCP header
+            const auto* tcp = ihl_cast<struct tcphdr>(buf, bytes);
+            if (!tcp) continue;
+
+            if (ntohs(tcp->source) != static_cast<uint16_t>(port)) continue;
+            if (ntohs(tcp->dest)   != src_port) continue;
+
+            timed_out = false;
+            r.response_time_ms = static_cast<int>(
+                std::chrono::duration_cast<std::chrono::milliseconds>(
+                    std::chrono::steady_clock::now() - t0).count());
+
+            if (tcp->syn && tcp->ack) {
+                r.status = "open";
+                // Raw recv: IP header available — real TTL
+                const auto* ip = reinterpret_cast<const struct iphdr*>(buf);
+                r.ttl     = ip->ttl;
+                r.os_hint = os_from_ttl(r.ttl);
+                send_rst(ssock, src_ip, tgt, src_port, port,
+                         const_cast<struct tcphdr*>(tcp));
+                if (opts_.service_detection) r.service  = lookup_service(port);
+                if (opts_.reverse_dns)       r.hostname = rdns(tgt);
+            } else if (tcp->rst) {
+                r.status = "closed";
+            }
+            break;
+        }
+
+        if (timed_out) ++stats_.timeouts;
+
+        close(ssock);
+        close(rsock);
+        return r;
+    }
+
+    // FIX-24: returns bool; false on inet_pton failure
+    bool send_syn(int sock, uint32_t src_ip, const std::string& dst,
+                  uint16_t src_port, int dst_port, uint32_t seq)
+    {
+        alignas(4) char pkt[sizeof(struct iphdr) + sizeof(struct tcphdr)]{};
+        auto* ip  = reinterpret_cast<struct iphdr*>(pkt);
+        auto* tcp = reinterpret_cast<struct tcphdr*>(
+                        pkt + sizeof(struct iphdr));
+
+        ip->ihl = 5; ip->version = 4;
+        ip->tot_len  = htons(sizeof(pkt));
+        ip->id       = htons(ThreadRng::u16());
+        ip->ttl      = 64;
+        ip->protocol = IPPROTO_TCP;
+        ip->saddr    = src_ip;
+        // FIX-24
+        if (inet_pton(AF_INET, dst.c_str(), &ip->daddr) != 1) return false;
+
+        tcp->source = htons(src_port);
+        tcp->dest   = htons(static_cast<uint16_t>(dst_port));
+        tcp->seq    = htonl(seq);
+        tcp->doff   = 5;
+        tcp->syn    = 1;
+        tcp->window = htons(5840);
+        tcp->check  = tcp_checksum(ip, tcp);
+        ip->check   = checksum(reinterpret_cast<const uint16_t*>(ip),
+                                static_cast<int>(sizeof(struct iphdr)));
+
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        if (inet_pton(AF_INET, dst.c_str(), &addr.sin_addr) != 1) return false;
+        sendto(sock, pkt, sizeof(pkt), 0,
+               reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+        return true;
+    }
+
+    void send_rst(int sock, uint32_t src_ip, const std::string& dst,
+                  uint16_t src_port, int dst_port, struct tcphdr* rtcp)
+    {
+        alignas(4) char pkt[sizeof(struct iphdr) + sizeof(struct tcphdr)]{};
+        auto* ip  = reinterpret_cast<struct iphdr*>(pkt);
+        auto* tcp = reinterpret_cast<struct tcphdr*>(
+                        pkt + sizeof(struct iphdr));
+
+        ip->ihl = 5; ip->version = 4;
+        ip->tot_len  = htons(sizeof(pkt));
+        ip->id       = htons(ThreadRng::u16());
+        ip->ttl      = 64;
+        ip->protocol = IPPROTO_TCP;
+        ip->saddr    = src_ip;
+        if (inet_pton(AF_INET, dst.c_str(), &ip->daddr) != 1) return;
+
+        tcp->source = htons(src_port);
+        tcp->dest   = htons(static_cast<uint16_t>(dst_port));
+        tcp->seq    = rtcp->ack_seq; // already network byte order
+        tcp->doff   = 5;
+        tcp->rst    = 1;
+        tcp->window = htons(5840);
+        tcp->check  = tcp_checksum(ip, tcp);
+        ip->check   = checksum(reinterpret_cast<const uint16_t*>(ip),
+                                static_cast<int>(sizeof(struct iphdr)));
+
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        if (inet_pton(AF_INET, dst.c_str(), &addr.sin_addr) != 1) return;
+        sendto(sock, pkt, sizeof(pkt), 0,
+               reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+    }
+
+    // ── FIX-25 + FIX-26 + FIX-19: UDP scan ──────────────────────────────────
+
+    ScanResult udp_scan(const std::string& tgt, int port) {
+        ScanResult r;
+        r.target    = tgt;
+        r.port      = port;
+        r.protocol  = "udp";
+        r.status    = "open|filtered";
+        r.timestamp = std::chrono::system_clock::now();
+
+        auto t0   = std::chrono::steady_clock::now();
+        int usock = socket(AF_INET, SOCK_DGRAM,  0);
+        int isock = socket(AF_INET, SOCK_RAW, IPPROTO_ICMP);
+        if (usock < 0 || isock < 0) {
+            if (usock >= 0) close(usock);
+            if (isock >= 0) close(isock);
+            ++stats_.errors;
+            return r;
+        }
+
+        fcntl(usock, F_SETFL, O_NONBLOCK);
+        fcntl(isock, F_SETFL, O_NONBLOCK);
+
+        struct sockaddr_in addr{};
+        addr.sin_family = AF_INET;
+        addr.sin_port   = htons(static_cast<uint16_t>(port));
+        if (inet_pton(AF_INET, tgt.c_str(), &addr.sin_addr) != 1) {
+            close(usock); close(isock);
+            ++stats_.errors;
+            return r;
+        }
+
+        sendto(usock, nullptr, 0, 0,
+               reinterpret_cast<struct sockaddr*>(&addr), sizeof(addr));
+
+        // FIX-25: watch for POLLERR/POLLHUP too
+        struct pollfd pfds[2]{
+            {isock, POLLIN | POLLERR | POLLHUP, 0},
+            {usock, POLLIN | POLLERR | POLLHUP, 0}
+        };
+        int pr = poll(pfds, 2, opts_.timeout_ms);
+
+        r.response_time_ms = static_cast<int>(
+            std::chrono::duration_cast<std::chrono::milliseconds>(
+                std::chrono::steady_clock::now() - t0).count());
+
+        if (pr > 0) {
+            // FIX-25: error conditions
+            if ((pfds[0].revents | pfds[1].revents) & (POLLERR | POLLHUP)) {
+                r.status = "error";
+                close(usock); close(isock);
+                return r;
+            }
+
+            if (pfds[0].revents & POLLIN) {
+                alignas(4) char buf[256]{};
+                struct sockaddr_in ra{};
+                socklen_t rlen = sizeof(ra);
+                int bytes = recvfrom(isock, buf, sizeof(buf), 0,
+                                     reinterpret_cast<struct sockaddr*>(&ra),
+                                     &rlen);
+                if (bytes > 0) {
+                    // FIX-19: source IP validation
+                    char ra_str[INET_ADDRSTRLEN];
+                    inet_ntop(AF_INET, &ra.sin_addr, ra_str, sizeof(ra_str));
+                    if (std::string(ra_str) == tgt) {
+                        // FIX-26: bounds-checked ICMP header
+                        const auto* icm =
+                            ihl_cast<struct icmphdr>(buf, bytes);
+                        if (icm && icm->type == 3 && icm->code == 3) {
+                            r.status = "closed";
+                            ++stats_.closed_ports;
+                        }
+                    }
+                }
+            }
+            if (pfds[1].revents & POLLIN) {
+                r.status = "open";
+                if (opts_.service_detection) r.service = lookup_service(port);
+                if (opts_.banner_grab) {
+                    alignas(4) char buf[1024]{};
+                    int n = recv(usock, buf, sizeof(buf) - 1, 0);
+                    if (n > 0) { buf[n] = '\0'; r.banner = clean_banner(buf); }
+                }
+            }
+        } else if (pr == 0) {
+            ++stats_.timeouts;
+        }
+
+        close(usock);
+        close(isock);
+        return r;
+    }
+
+    // ── checksum helpers ─────────────────────────────────────────────────────
+
+    static uint16_t checksum(const uint16_t* buf, int len) {
+        uint32_t sum = 0;
+        while (len > 1) { sum += *buf++; len -= 2; }
+        if (len == 1) sum += *reinterpret_cast<const uint8_t*>(buf);
+        sum = (sum >> 16) + (sum & 0xFFFF);
+        sum += (sum >> 16);
+        return static_cast<uint16_t>(~sum);
+    }
+
+    uint16_t tcp_checksum(struct iphdr* ip, struct tcphdr* tcp) {
+        PseudoHeader ph{};
+        ph.src_addr = ip->saddr;
+        ph.dst_addr = ip->daddr;
+        ph.zero     = 0;
+        ph.protocol = IPPROTO_TCP;
+        ph.tcp_len  = htons(sizeof(struct tcphdr));
+        alignas(4) char buf[sizeof(PseudoHeader) + sizeof(struct tcphdr)]{};
+        memcpy(buf,              &ph,  sizeof(ph));
+        memcpy(buf + sizeof(ph), tcp,  sizeof(struct tcphdr));
+        return checksum(reinterpret_cast<const uint16_t*>(buf), sizeof(buf));
+    }
+
+    // ── helpers ──────────────────────────────────────────────────────────────
+
+    static std::string os_from_ttl(int ttl) {
+        int initial = (ttl <= 64) ? 64 : (ttl <= 128) ? 128 : 255;
+        switch (initial) {
+            case 64:  return "Linux/Unix/macOS";
+            case 128: return "Windows";
+            default:  return "Network Device/Cisco";
         }
     }
-    
-    // ========================================================================
-    // Statistics and output
-    // ========================================================================
-    
-    void update_statistics(const ScanResult& result) {
-        if (result.status == "open") stats_.open_ports++;
-        else if (result.status == "closed") stats_.closed_ports++;
-        else if (result.status == "filtered") stats_.filtered_ports++;
-        else if (result.status == "timeout") stats_.timeouts++;
+
+    std::string lookup_service(int port) const {
+        auto it = svc_.find(port);
+        return it != svc_.end() ? it->second : "unknown";
     }
-    
+
+    std::string grab_banner(int sock, int port) {
+        int fl = fcntl(sock, F_GETFL, 0);
+        if (fl >= 0) fcntl(sock, F_SETFL, fl & ~O_NONBLOCK);
+
+        std::string probe;
+        if (port == 80 || port == 8080 || port == 8000 || port == 8008)
+            probe = "HEAD / HTTP/1.0\r\nHost: localhost\r\n\r\n";
+        else if (port == 25 || port == 587)
+            probe = "EHLO localhost\r\n";
+        else if (port == 110)
+            probe = "QUIT\r\n";
+        else if (port == 21 || port == 22 || port == 23)
+            probe = "";
+        else
+            probe = "\r\n";
+
+        if (!probe.empty()) {
+            size_t sent_total = 0;
+            while (sent_total < probe.size()) {
+                ssize_t n = send(sock,
+                                 probe.c_str() + sent_total,
+                                 probe.size()  - sent_total,
+                                 MSG_NOSIGNAL);
+                if (n < 0) {
+                    if (errno == EINTR) continue;
+                    return {};
+                }
+                sent_total += static_cast<size_t>(n);
+            }
+        }
+
+        struct timeval tv{0, static_cast<suseconds_t>(opts_.timeout_ms * 1000)};
+        setsockopt(sock, SOL_SOCKET, SO_RCVTIMEO, &tv, sizeof(tv));
+
+        alignas(4) char buf[4096]{};
+        int n = recv(sock, buf, sizeof(buf) - 1, 0);
+        if (n > 0) { buf[n] = '\0'; return clean_banner(buf); }
+        return {};
+    }
+
+    static std::string clean_banner(const char* raw) {
+        std::string out;
+        for (const char* p = raw; *p; ++p) {
+            unsigned char c = static_cast<unsigned char>(*p);
+            out += (std::isprint(c) || c == '\n' || c == '\r') ? *p : '.';
+        }
+        return out;
+    }
+
+    std::string rdns(const std::string& ip) {
+        struct sockaddr_in a{};
+        a.sin_family = AF_INET;
+        if (inet_pton(AF_INET, ip.c_str(), &a.sin_addr) != 1) return {};
+        char host[NI_MAXHOST];
+        if (getnameinfo(reinterpret_cast<struct sockaddr*>(&a), sizeof(a),
+                        host, sizeof(host), nullptr, 0, NI_NAMEREQD) == 0)
+            return host;
+        return {};
+    }
+
+    void check_vulns(ScanResult& r) {
+        for (const auto& v : vuln_db_) {
+            if (r.service != v.service) continue;
+            if (r.banner.compare(0, v.banner_prefix.size(),
+                                 v.banner_prefix) == 0)
+                r.banner += " [" + v.cve_id + ": " + v.description + "]";
+        }
+    }
+
+    // ── statistics & output ──────────────────────────────────────────────────
+
+    void update_stats(const ScanResult& r) {
+        if      (r.status == "open")     ++stats_.open_ports;
+        else if (r.status == "closed")   ++stats_.closed_ports;
+        else if (r.status == "filtered") ++stats_.filtered_ports;
+        else if (r.status == "timeout")  ++stats_.timeouts;
+        else if (r.status == "error")    ++stats_.errors;
+    }
+
     void print_banner() {
-        std::cout << "\n";
-        std::cout << "  ╔════════════════════════════════════════════════╗\n";
-        std::cout << "  ║              S E N T I N E L                   ║\n";
-        std::cout << "  ║        Advanced Port Scanner v1.0              ║\n";
-        std::cout << "  ║     Production-Ready Network Security Tool     ║\n";
-        std::cout << "  ╚════════════════════════════════════════════════╝\n";
-        std::cout << "\n";
+        std::lock_guard<std::mutex> lk(io_mutex_);
+        std::cout <<
+            "\n"
+            "  ╔════════════════════════════════════════════════╗\n"
+            "  ║              S E N T I N E L                   ║\n"
+            "  ║        Advanced Port Scanner v3.0              ║\n"
+            "  ║     Production-Ready Network Security Tool     ║\n"
+            "  ╚════════════════════════════════════════════════╝\n\n";
     }
-    
+
     void print_progress() {
-        static int last_percent = -1;
-        int percent = static_cast<int>(stats_.progress());
-        
-        if (percent != last_percent && percent % 5 == 0) {
-            std::cout << "\r[*] Progress: " << std::setw(3) << percent << "% "
-                      << "[" << std::string(percent / 2, '=') 
-                      << std::string(50 - percent / 2, ' ') << "] "
-                      << stats_.scanned_ports << "/" << stats_.total_ports
-                      << " ports (" << std::fixed << std::setprecision(1) 
-                      << stats_.packets_per_second() << " pps)" << std::flush;
-            last_percent = percent;
-        }
+        int pct      = static_cast<int>(stats_.progress());
+        int expected = last_progress_pct_.load(std::memory_order_relaxed);
+        if (pct % 5 != 0 || pct == expected) return;
+        if (!last_progress_pct_.compare_exchange_strong(expected, pct)) return;
+
+        std::lock_guard<std::mutex> lk(io_mutex_);
+        std::cout << "\r[*] Progress: " << std::setw(3) << pct << "% ["
+                  << std::string(static_cast<size_t>(pct / 2), '=')
+                  << std::string(static_cast<size_t>(50 - pct / 2), ' ')
+                  << "] "
+                  << stats_.scanned_ports.load(std::memory_order_relaxed)
+                  << '/' << stats_.total_ports.load(std::memory_order_relaxed)
+                  << " (" << std::fixed << std::setprecision(1)
+                  << stats_.packets_per_second() << " pps)" << std::flush;
     }
-    
-    void print_result(const ScanResult& result) {
-        std::lock_guard<std::mutex> lock(results_mutex_);
-        
-        std::cout << "\n[+] " << std::left << std::setw(15) << result.target
-                  << ":" << std::right << std::setw(5) << result.port << "/" 
-                  << result.protocol << "  " << std::setw(10) << result.status;
-        
-        if (!result.service.empty()) {
-            std::cout << "  " << result.service;
+
+    void print_result_nolock(const ScanResult& r) {
+        std::cout << "\n[+] " << std::left  << std::setw(15) << r.target
+                  << ':'      << std::right << std::setw(5)  << r.port
+                  << '/'      << r.protocol
+                  << "  "     << std::setw(12) << r.status;
+        if (!r.service.empty())     std::cout << "  " << r.service;
+        if (r.response_time_ms > 0) std::cout << "  [" << r.response_time_ms << "ms]";
+        if (!r.os_hint.empty())     std::cout << "  OS:" << r.os_hint;
+        if (!r.hostname.empty())    std::cout << "  (" << r.hostname << ')';
+        if (!r.banner.empty()) {
+            std::cout << "\n      Banner: " << r.banner.substr(0, 120);
+            if (r.banner.size() > 120) std::cout << "...";
         }
-        
-        if (result.response_time_ms > 0) {
-            std::cout << "  [" << result.response_time_ms << "ms]";
-        }
-        
-        if (!result.hostname.empty()) {
-            std::cout << "  (" << result.hostname << ")";
-        }
-        
-        if (!result.banner.empty()) {
-            std::cout << "\n      Banner: " << result.banner.substr(0, 100);
-            if (result.banner.length() > 100) std::cout << "...";
-        }
-        
-        std::cout << std::endl;
+        std::cout << '\n';
     }
-    
+
     void print_statistics() {
+        if (!stats_.end_time.is_ready()) return;
         auto elapsed = std::chrono::duration_cast<std::chrono::seconds>(
-            stats_.end_time - stats_.start_time);
-        
-        std::cout << "\n\n";
-        std::cout << "╔════════════════════════════════════════════════════════╗\n";
-        std::cout << "║                    SCAN STATISTICS                     ║\n";
-        std::cout << "╠════════════════════════════════════════════════════════╣\n";
-        std::cout << "║  Total ports scanned: " << std::setw(35) << std::left 
-                  << stats_.total_ports.load() << "║\n";
-        std::cout << "║  Open ports:           " << std::setw(35) 
-                  << stats_.open_ports.load() << "║\n";
-        std::cout << "║  Closed ports:         " << std::setw(35) 
-                  << stats_.closed_ports.load() << "║\n";
-        std::cout << "║  Filtered ports:       " << std::setw(35) 
-                  << stats_.filtered_ports.load() << "║\n";
-        std::cout << "║  Timeouts:             " << std::setw(35) 
-                  << stats_.timeouts.load() << "║\n";
-        std::cout << "║  Errors:               " << std::setw(35) 
-                  << stats_.errors.load() << "║\n";
-        std::cout << "║  Scan duration:        " << std::setw(35) 
-                  << std::to_string(elapsed.count()) + " seconds" << "║\n";
-        std::cout << "║  Packets/sec:          " << std::setw(35) 
-                  << std::fixed << std::setprecision(1) 
-                  << stats_.packets_per_second() << "║\n";
+            stats_.end_time.get() - stats_.start_time.get());
+
+        std::lock_guard<std::mutex> lk(io_mutex_);
+        std::cout <<
+            "\n\n"
+            "╔════════════════════════════════════════════════════════╗\n"
+            "║                    SCAN STATISTICS                     ║\n"
+            "╠════════════════════════════════════════════════════════╣\n";
+        auto row = [](const char* lbl, auto val) {
+            std::cout << "║  " << std::left  << std::setw(24) << lbl
+                      << std::right << std::setw(32) << val  << "║\n";
+        };
+        row("Total ports scanned:", stats_.total_ports.load());
+        row("Open ports:",          stats_.open_ports.load());
+        row("Closed ports:",        stats_.closed_ports.load());
+        row("Filtered ports:",      stats_.filtered_ports.load());
+        row("Timeouts:",            stats_.timeouts.load());
+        row("Errors:",              stats_.errors.load());
+        row("Scan duration (s):",   elapsed.count());
         std::cout << "╚════════════════════════════════════════════════════════╝\n";
     }
-    
+
     void save_results() {
         if (opts_.output_file.empty()) return;
-        
-        std::ofstream file(opts_.output_file);
-        if (!file.is_open()) {
-            std::cerr << "\n[!] Cannot open output file: " << opts_.output_file << std::endl;
+        std::ofstream f(opts_.output_file);
+        if (!f) {
+            std::cerr << "[!] Cannot open: " << opts_.output_file << '\n';
             return;
         }
-        
-        if (opts_.output_format == "json" || opts_.json_output) {
-            save_json(file);
-        } else if (opts_.output_format == "csv" || opts_.csv_output) {
-            save_csv(file);
-        } else {
-            save_text(file);
-        }
-        
-        std::cout << "\n[+] Results saved to: " << opts_.output_file << std::endl;
+        if      (opts_.json_output || opts_.output_format == "json") save_json(f);
+        else if (opts_.csv_output  || opts_.output_format == "csv")  save_csv(f);
+        else                                                          save_text(f);
+        std::cout << "[+] Results → " << opts_.output_file << '\n';
     }
-    
-    void save_json(std::ofstream& file) {
-        file << "{\n";
-        file << "  \"scan_timestamp\": \"" << current_time() << "\",\n";
-        file << "  \"statistics\": {\n";
-        file << "    \"total_ports\": " << stats_.total_ports << ",\n";
-        file << "    \"open_ports\": " << stats_.open_ports << ",\n";
-        file << "    \"closed_ports\": " << stats_.closed_ports << ",\n";
-        file << "    \"filtered_ports\": " << stats_.filtered_ports << ",\n";
-        file << "    \"timeouts\": " << stats_.timeouts << "\n";
-        file << "  },\n";
-        file << "  \"results\": [\n";
-        
+
+    void save_json(std::ofstream& f) {
+        f << "{\n  \"scan_timestamp\":\"" << current_time_ts() << "\",\n"
+          << "  \"statistics\":{"
+          << "\"total\":"     << stats_.total_ports
+          << ",\"open\":"     << stats_.open_ports
+          << ",\"closed\":"   << stats_.closed_ports
+          << ",\"filtered\":" << stats_.filtered_ports
+          << ",\"timeouts\":" << stats_.timeouts
+          << ",\"errors\":"   << stats_.errors << "},\n"
+          << "  \"results\":[\n";
         for (size_t i = 0; i < results_.size(); ++i) {
             const auto& r = results_[i];
-            file << "    {\n";
-            file << "      \"target\": \"" << json_escape(r.target) << "\",\n";
-            file << "      \"port\": " << r.port << ",\n";
-            file << "      \"protocol\": \"" << r.protocol << "\",\n";
-            file << "      \"status\": \"" << r.status << "\",\n";
-            file << "      \"service\": \"" << json_escape(r.service) << "\",\n";
-            file << "      \"banner\": \"" << json_escape(r.banner) << "\",\n";
-            file << "      \"hostname\": \"" << json_escape(r.hostname) << "\",\n";
-            file << "      \"response_time_ms\": " << r.response_time_ms << ",\n";
-            file << "      \"os_hint\": \"" << r.os_hint << "\"\n";
-            file << "    }";
-            if (i < results_.size() - 1) file << ",";
-            file << "\n";
+            f << "    {\"target\":\""  << je(r.target)      << "\","
+              << "\"port\":"           << r.port             << ","
+              << "\"protocol\":\""     << r.protocol         << "\","
+              << "\"status\":\""       << r.status           << "\","
+              << "\"service\":\""      << je(r.service)      << "\","
+              << "\"banner\":\""       << je(r.banner)       << "\","
+              << "\"hostname\":\""     << je(r.hostname)     << "\","
+              << "\"response_ms\":"    << r.response_time_ms << ","
+              << "\"ttl\":"            << r.ttl              << ","
+              << "\"os_hint\":\""      << je(r.os_hint)      << "\"}";
+            if (i + 1 < results_.size()) f << ',';
+            f << '\n';
         }
-        
-        file << "  ]\n}\n";
+        f << "  ]\n}\n";
     }
-    
-    void save_csv(std::ofstream& file) {
-        file << "timestamp,target,port,protocol,status,service,banner,hostname,response_time_ms,os_hint\n";
-        
+
+    void save_csv(std::ofstream& f) {
+        f << "timestamp,target,port,protocol,status,service,"
+             "banner,hostname,ms,ttl,os\n";
         for (const auto& r : results_) {
-            file << current_time() << ","
-                 << r.target << ","
-                 << r.port << ","
-                 << r.protocol << ","
-                 << r.status << ","
-                 << "\"" << csv_escape(r.service) << "\","
-                 << "\"" << csv_escape(r.banner) << "\","
-                 << "\"" << r.hostname << "\","
-                 << r.response_time_ms << ","
-                 << "\"" << r.os_hint << "\"\n";
+            f << current_time_ts() << ','
+              << r.target << ',' << r.port << ',' << r.protocol << ','
+              << r.status << ",\"" << ce(r.service)  << "\",\""
+              << ce(r.banner)      << "\",\"" << ce(r.hostname) << "\","
+              << r.response_time_ms << ',' << r.ttl << ",\""
+              << r.os_hint << "\"\n";
         }
     }
-    
-    void save_text(std::ofstream& file) {
-        file << "Sentinel Scan Results - " << current_time() << "\n";
-        file << "========================================\n\n";
-        
+
+    void save_text(std::ofstream& f) {
+        f << "Sentinel Scan Results — " << current_time_ts() << "\n"
+          << "==========================================\n\n";
         for (const auto& r : results_) {
-            if (r.status == "open") {
-                file << "PORT " << r.port << "/" << r.protocol 
-                     << " - " << r.status << " - " << r.service << "\n";
-                if (!r.banner.empty()) {
-                    file << "  Banner: " << r.banner << "\n";
-                }
-                if (!r.hostname.empty()) {
-                    file << "  Hostname: " << r.hostname << "\n";
-                }
-                file << "\n";
-            }
+            if (r.status != "open") continue;
+            f << "PORT " << r.port << '/' << r.protocol << " OPEN  " << r.service;
+            if (!r.os_hint.empty())  f << "  OS:" << r.os_hint;
+            if (!r.hostname.empty()) f << "  (" << r.hostname << ')';
+            f << '\n';
+            if (!r.banner.empty())   f << "  Banner: " << r.banner << '\n';
+            f << '\n';
         }
     }
-    
-    std::string current_time() {
-        auto now = std::chrono::system_clock::now();
-        auto time_t = std::chrono::system_clock::to_time_t(now);
-        std::stringstream ss;
-        ss << std::put_time(std::localtime(&time_t), "%Y-%m-%d %H:%M:%S");
-        return ss.str();
-    }
-    
-    std::string json_escape(const std::string& s) {
-        std::string result;
-        for (char c : s) {
+
+    static std::string je(const std::string& s) {
+        std::string o;
+        for (unsigned char c : s) {
             switch (c) {
-                case '"': result += "\\\""; break;
-                case '\\': result += "\\\\"; break;
-                case '\b': result += "\\b"; break;
-                case '\f': result += "\\f"; break;
-                case '\n': result += "\\n"; break;
-                case '\r': result += "\\r"; break;
-                case '\t': result += "\\t"; break;
+                case '"':  o += "\\\""; break;
+                case '\\': o += "\\\\"; break;
+                case '\n': o += "\\n";  break;
+                case '\r': o += "\\r";  break;
+                case '\t': o += "\\t";  break;
                 default:
-                    if (static_cast<unsigned char>(c) < 0x20) {
-                        char buf[8];
-                        snprintf(buf, sizeof(buf), "\\u%04x", c);
-                        result += buf;
+                    if (c < 0x20) {
+                        char b[8]; snprintf(b, 8, "\\u%04x", c); o += b;
                     } else {
-                        result += c;
+                        o += static_cast<char>(c);
                     }
             }
         }
-        return result;
+        return o;
     }
-    
-    std::string csv_escape(const std::string& s) {
-        std::string result;
-        for (char c : s) {
-            if (c == '"') {
-                result += "\"\"";
-            } else {
-                result += c;
-            }
-        }
-        return result;
+
+    static std::string ce(const std::string& s) {
+        std::string o;
+        for (char c : s) { if (c == '"') o += "\"\""; else o += c; }
+        return o;
     }
 };
 
 // ============================================================================
-// Command Line Argument Parser
+// FIX-34 — Argument Parser (exceptions instead of exit; stoi wrapped)
 // ============================================================================
 
-class ArgumentParser {
+class ArgParser {
 public:
     static ScanOptions parse(int argc, char* argv[]) {
-        ScanOptions opts;
-        
-        if (argc < 2) {
-            print_help();
-            exit(1);
-        }
-        
-        opts.num_threads = std::thread::hardware_concurrency() * 2;
-        
+        ScanOptions o;
+        if (argc < 2) { help(); throw std::runtime_error("No arguments"); }
+
         for (int i = 1; i < argc; ++i) {
-            std::string arg = argv[i];
-            
-            if (arg == "--help" || arg == "-h") {
-                print_help();
-                exit(0);
+            std::string a = argv[i];
+
+            // FIX-34: next() throws instead of calling exit()
+            auto next = [&]() -> const char* {
+                if (++i < argc) return argv[i];
+                throw std::runtime_error(
+                    std::string("Missing argument for ") + a);
+            };
+
+            if      (a=="-h"||a=="--help")    { help(); throw std::runtime_error("help"); }
+            else if (a=="-t"||a=="--target")   parse_targets(next(), o);
+            else if (a=="-p"||a=="--ports")    parse_ports(next(), o);
+            else if (a=="--threads")           o.num_threads  = safe_stoi(next(), a);
+            else if (a=="--timeout")           o.timeout_ms   = safe_stoi(next(), a);
+            else if (a=="-o"||a=="--output")   o.output_file  = next();
+            else if (a=="-f"||a=="--format") {
+                o.output_format = next();
+                if (o.output_format=="json") o.json_output = true;
+                if (o.output_format=="csv")  o.csv_output  = true;
             }
-            else if (arg == "--target" || arg == "-t") {
-                if (++i < argc) parse_targets(argv[i], opts);
+            else if (a=="-v"||a=="--verbose")  o.verbose            = true;
+            else if (a=="--udp")               o.udp_scan           = true;
+            else if (a=="--syn")               o.syn_scan           = true;
+            else if (a=="--no-service")        o.service_detection  = false;
+            else if (a=="--banner")            o.banner_grab        = true;
+            else if (a=="--dns")               o.reverse_dns        = true;
+            else if (a=="--no-ping")           o.icmp_ping          = false;
+            else if (a=="--randomize")         o.randomize_ports    = true;
+            else if (a=="--rate")              o.rate_limit         = safe_stoi(next(), a);
+            else if (a=="--exclude")           parse_ports(next(), o, true);
+            else if (a=="--cidr")              o.cidr_support       = true;
+            else if (a=="--continuous") {
+                o.continuous_mode   = true;
+                o.scan_interval_sec = safe_stoi(next(), a);
             }
-            else if (arg == "--ports" || arg == "-p") {
-                if (++i < argc) parse_ports(argv[i], opts);
-            }
-            else if (arg == "--threads") {
-                if (++i < argc) opts.num_threads = std::stoi(argv[i]);
-            }
-            else if (arg == "--timeout") {
-                if (++i < argc) opts.timeout_ms = std::stoi(argv[i]);
-            }
-            else if (arg == "--output" || arg == "-o") {
-                if (++i < argc) opts.output_file = argv[i];
-            }
-            else if (arg == "--format" || arg == "-f") {
-                if (++i < argc) {
-                    opts.output_format = argv[i];
-                    if (opts.output_format == "json") opts.json_output = true;
-                    if (opts.output_format == "csv") opts.csv_output = true;
-                }
-            }
-            else if (arg == "--verbose" || arg == "-v") {
-                opts.verbose = true;
-            }
-            else if (arg == "--udp") {
-                opts.udp_scan = true;
-            }
-            else if (arg == "--syn") {
-                opts.syn_scan = true;
-            }
-            else if (arg == "--no-service") {
-                opts.service_detection = false;
-            }
-            else if (arg == "--banner") {
-                opts.banner_grab = true;
-            }
-            else if (arg == "--dns") {
-                opts.reverse_dns = true;
-            }
-            else if (arg == "--no-ping") {
-                opts.icmp_ping = false;
-            }
-            else if (arg == "--randomize") {
-                opts.randomize_ports = true;
-            }
-            else if (arg == "--rate") {
-                if (++i < argc) opts.rate_limit = std::stoi(argv[i]);
-            }
-            else if (arg == "--exclude") {
-                if (++i < argc) parse_ports(argv[i], opts, true);
-            }
-            else if (arg == "--os-detect") {
-                opts.os_detection = true;
-            }
-            else if (arg == "--cidr") {
-                opts.cidr_support = true;
-            }
-            else if (arg == "--continuous") {
-                opts.continuous_mode = true;
-                if (++i < argc) opts.scan_interval_sec = std::stoi(argv[i]);
-            }
-            else if (arg == "--vuln") {
-                opts.vulnerability_check = true;
-            }
-            else if (arg == "--geoip") {
-                opts.geoip = true;
+            else if (a=="--vuln")              o.vulnerability_check = true;
+            else {
+                std::cerr << "[!] Unknown option: " << a << '\n';
             }
         }
-        
-        if (opts.targets.empty()) {
-            std::cerr << "Error: No targets specified\n";
-            print_help();
-            exit(1);
-        }
-        
-        return opts;
+
+        if (o.targets.empty())
+            throw std::runtime_error("No targets specified (use -t)");
+        return o;
     }
 
 private:
-    static void print_help() {
+    // FIX-34: user-friendly stoi wrapper
+    static int safe_stoi(const char* s, const std::string& opt) {
+        try { return std::stoi(s); }
+        catch (const std::exception&) {
+            throw std::runtime_error(
+                "Invalid integer '" + std::string(s) +
+                "' for option " + opt);
+        }
+    }
+
+    static void help() {
         std::cout << R"(
-╔════════════════════════════════════════════════════════════════╗
-║                    SENTINEL - Help Menu                       ║
-║              Advanced Port Scanner v1.0                ║
-╚════════════════════════════════════════════════════════════════╝
+╔═══════════════════════════════════════════════════════════════╗
+║                SENTINEL v3.0 — Help                          ║
+╚═══════════════════════════════════════════════════════════════╝
 
-USAGE:
-  sentinel [options]
+USAGE:  sentinel [options]
 
-REQUIRED OPTIONS:
-  -t, --target <ip>         Target IP address(es) (comma-separated or file)
-  -p, --ports <range>       Port range (e.g., 1-1000,80,443,8080-8090)
+REQUIRED:
+  -t, --target <ip|file>    Target IP(s), comma-separated or file
+  -p, --ports  <range>      Ports: 1-1000,80,443,8080-8090
 
 SCAN TYPES:
-  --syn                     SYN stealth scan (requires root)
-  --udp                     UDP scan (requires root)
-  (default: TCP connect scan)
+  --syn                     SYN stealth (requires root)
+  --udp                     UDP scan    (requires root)
+  (default: TCP connect)
 
 PERFORMANCE:
-  --threads <num>           Number of threads (default: CPU cores * 2)
-  --timeout <ms>            Timeout in milliseconds (default: 200)
-  --rate <num>              Rate limit (packets per second)
-  --randomize               Randomize port scan order
+  --threads <n>             Worker threads  [1-1024, default: nCPU*2]
+  --timeout <ms>            Per-port timeout [1-30000, default: 200]
+  --rate    <pps>           Rate limit (packets/sec)
+  --randomize               Shuffle port order
 
 OUTPUT:
-  -o, --output <file>       Output file
-  -f, --format <format>     Output format: text, json, csv
-  -v, --verbose             Verbose output
+  -o, --output <file>       Write results to file
+  -f, --format <fmt>        text | json | csv
+  -v, --verbose             Verbose mode
 
 DISCOVERY:
-  --no-ping                  Skip ICMP ping discovery
-  --banner                   Grab service banners
-  --dns                      Reverse DNS lookup
-  --os-detect                OS fingerprinting
-  --service                  Service detection (default: on)
+  --no-ping                 Skip ICMP ping sweep
+  --banner                  Grab service banners
+  --dns                     Reverse DNS lookup
 
 ADVANCED:
-  --exclude <range>         Ports to exclude
-  --cidr                     Enable CIDR notation support
-  --continuous [seconds]    Continuous scanning mode
-  --vuln                     Check for known vulnerabilities
-  --geoip                    GeoIP lookup
-
-MISC:
-  -h, --help                 Show this help
+  --exclude <range>         Exclude ports
+  --cidr                    CIDR notation (/32, /31, max 65536 hosts)
+  --continuous <sec>        Repeat scan every N seconds
+  --vuln                    Banner-based CVE check
 
 EXAMPLES:
-  # Basic TCP scan
   sentinel -t 192.168.1.1 -p 1-1000
-
-  # SYN stealth scan with banner grabbing
   sudo sentinel -t 10.0.0.1 -p 22,80,443 --syn --banner --dns
-
-  # Multiple targets with CIDR
   sentinel -t 192.168.1.0/24 -p 1-1024 --cidr
-
-  # High-performance scan
-  sentinel -t targets.txt -p 1-65535 --threads 100 --rate 1000
-
-  # Vulnerability scan with JSON output
-  sentinel -t 192.168.1.1 -p 1-1000 --vuln --banner -o scan.json -f json
-
-  # Continuous monitoring
-  sentinel -t 192.168.1.1 -p 22,80,443 --continuous 60
-
+  sentinel -t hosts.txt -p 1-65535 --threads 200 --rate 5000
+  sentinel -t 10.0.0.1 -p 1-1000 --vuln --banner -o out.json -f json
+  sentinel -t 10.0.0.1 -p 22,80,443 --continuous 60
 )";
     }
-    
-    static void parse_targets(const std::string& input, ScanOptions& opts) {
-        std::ifstream file(input);
-        if (file.good()) {
+
+    static void parse_targets(const char* input, ScanOptions& o) {
+        std::ifstream f(input);
+        if (f.good()) {
             std::string line;
-            while (std::getline(file, line)) {
+            while (std::getline(f, line)) {
                 line = trim(line);
-                if (!line.empty() && line[0] != '#') {
-                    opts.targets.push_back(line);
-                }
+                if (!line.empty() && line[0] != '#')
+                    o.targets.push_back(line);
             }
         } else {
-            std::stringstream ss(input);
+            std::istringstream ss(input);
             std::string item;
             while (std::getline(ss, item, ',')) {
                 item = trim(item);
-                if (!item.empty()) {
-                    opts.targets.push_back(item);
-                }
+                if (!item.empty()) o.targets.push_back(item);
             }
         }
     }
-    
-    static void parse_ports(const std::string& input, ScanOptions& opts, bool exclude = false) {
-        std::stringstream ss(input);
-        std::string token;
-        
-        while (std::getline(ss, token, ',')) {
-            token = trim(token);
-            size_t dash_pos = token.find('-');
-            
-            if (dash_pos != std::string::npos) {
-                int start = std::stoi(token.substr(0, dash_pos));
-                int end = std::stoi(token.substr(dash_pos + 1));
-                
-                if (start > end) std::swap(start, end);
-                
-                for (int port = start; port <= end; ++port) {
-                    if (port > 0 && port <= 65535) {
-                        if (exclude) opts.exclude_ports.push_back(port);
-                        else opts.ports.push_back(port);
-                    }
+
+    static void parse_ports(const char* input, ScanOptions& o,
+                             bool exclude = false) {
+        std::istringstream ss(input);
+        std::string tok;
+        while (std::getline(ss, tok, ',')) {
+            tok = trim(tok);
+            if (tok.empty()) continue;
+            auto dash = tok.find('-');
+            try {
+                if (dash != std::string::npos) {
+                    int lo = std::stoi(tok.substr(0, dash));
+                    int hi = std::stoi(tok.substr(dash + 1));
+                    if (lo > hi) std::swap(lo, hi);
+                    for (int p = lo; p <= hi; ++p)
+                        if (p > 0 && p <= 65535)
+                            (exclude ? o.exclude_ports : o.ports).push_back(p);
+                } else {
+                    int p = std::stoi(tok);
+                    if (p > 0 && p <= 65535)
+                        (exclude ? o.exclude_ports : o.ports).push_back(p);
                 }
-            } else {
-                int port = std::stoi(token);
-                if (port > 0 && port <= 65535) {
-                    if (exclude) opts.exclude_ports.push_back(port);
-                    else opts.ports.push_back(port);
-                }
+            } catch (const std::exception&) {
+                std::cerr << "[!] Invalid port token: " << tok << '\n';
             }
         }
     }
-    
+
     static std::string trim(const std::string& s) {
-        size_t start = s.find_first_not_of(" \t\r\n");
-        if (start == std::string::npos) return "";
-        size_t end = s.find_last_not_of(" \t\r\n");
-        return s.substr(start, end - start + 1);
+        auto b = s.find_first_not_of(" \t\r\n");
+        if (b == std::string::npos) return {};
+        return s.substr(b, s.find_last_not_of(" \t\r\n") - b + 1);
     }
 };
 
 // ============================================================================
-// Main function
+// Entry point
 // ============================================================================
 
 int main(int argc, char* argv[]) {
     try {
-        auto options = ArgumentParser::parse(argc, argv);
-        
-        // Check for root requirements
-        if ((options.syn_scan || options.udp_scan) && geteuid() != 0) {
-            std::cerr << "\n[!] Warning: SYN/UDP scans require root privileges.\n";
-            std::cerr << "    Falling back to TCP connect scan.\n";
-            options.syn_scan = false;
-            options.udp_scan = false;
+        ScanOptions opts;
+        try {
+            opts = ArgParser::parse(argc, argv);
+        } catch (const std::runtime_error& e) {
+            // "help" exception is benign
+            std::string w = e.what();
+            if (w != "help" && w != "No arguments")
+                std::cerr << "[!] Argument error: " << w << '\n';
+            return (w == "help") ? 0 : 1;
         }
-        
-        // Increase file descriptor limit
-        struct rlimit rl;
+
+        if ((opts.syn_scan || opts.udp_scan) && geteuid() != 0) {
+            std::cerr << "[!] SYN/UDP require root. "
+                         "Falling back to TCP connect.\n";
+            opts.syn_scan = opts.udp_scan = false;
+        }
+
+        // Raise fd limit
+        struct rlimit rl{};
         if (getrlimit(RLIMIT_NOFILE, &rl) == 0) {
             rl.rlim_cur = std::min(static_cast<rlim_t>(65535), rl.rlim_max);
             setrlimit(RLIMIT_NOFILE, &rl);
         }
-        
-        // Continuous mode
-        if (options.continuous_mode) {
-            int scan_count = 1;
-            while (!g_stop_signal) {
-                std::cout << "\n[ Scan #" << scan_count++ << " starting... ]\n";
-                
-                Sentinel scanner(options);
-                scanner.scan();
-                
-                if (g_stop_signal) break;
-                
-                std::cout << "\n[*] Waiting " << options.scan_interval_sec 
-                          << " seconds before next scan...\n";
-                std::this_thread::sleep_for(std::chrono::seconds(options.scan_interval_sec));
+
+        if (opts.continuous_mode) {
+            int n = 1;
+            while (!g_stop_signal.load(std::memory_order_acquire)) {
+                std::cout << "\n[ Scan #" << n++ << " ]\n";
+                Sentinel s(opts);
+                s.scan();
+                if (g_stop_signal.load(std::memory_order_acquire)) break;
+                std::cout << "[*] Next scan in "
+                          << opts.scan_interval_sec << "s…\n";
+                std::this_thread::sleep_for(
+                    std::chrono::seconds(opts.scan_interval_sec));
             }
         } else {
-            Sentinel scanner(options);
-            scanner.scan();
+            Sentinel s(opts);
+            s.scan();
         }
-        
+
     } catch (const std::exception& e) {
-        std::cerr << "\n[!] Fatal error: " << e.what() << std::endl;
+        std::cerr << "[!] Fatal: " << e.what() << '\n';
         return 1;
     }
-    
-    std::cout << "\n[*] Sentinel scan completed.\n";
+
+    std::cout << "\n[*] Sentinel finished.\n";
     return 0;
 }
